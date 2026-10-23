@@ -1,0 +1,22 @@
+# ===== 凭据：绝对不要提交 =====
+# 含 accessToken / refreshToken / 学号 / 手机号 / 真实姓名
+state.json
+
+# ===== 抓包与导出：体积大且含个人数据 =====
+captures/
+
+# ===== 运行产物 =====
+logs/
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 本机环境检测 =====
+环境自检结果.txt
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

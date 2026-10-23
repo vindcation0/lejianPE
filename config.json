@@ -1,0 +1,24 @@
+{
+  "targets": [
+    "户外跑",
+    "跳绳",
+    "排球",
+    "羽毛球",
+    "篮球1",
+    "篮球2",
+    "毽球",
+    "匹克球",
+    "乒乓球",
+    "足球"
+  ],
+  "special": ["体质健康测试"],
+  "exclude_member": true,
+  "max_normal": 2,
+  "max_per_day": 1,
+  "current_week": 8,
+  "watch_from": "13:59:00",
+  "watch_until": "16:00:00",
+  "poll_interval_ms": 500,
+  "dry_run": true,
+  "busy_slots": []
+}
