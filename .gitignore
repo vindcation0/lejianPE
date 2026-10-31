@@ -7,6 +7,11 @@ captures/
 
 # ===== 运行产物 =====
 logs/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.lock
 __pycache__/
 *.pyc
 *.pyo

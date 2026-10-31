@@ -7,6 +7,8 @@
 
 📄 **接手或二次开发请先读**：[逆向与接口结论](docs/04-逆向与接口结论.md) —— 完整接口清单、抓包方法、业务规则与踩坑记录。
 
+⚠️ **首次实战的故障复盘**：[2026-10-25 故障报告](docs/05-2026-10-25-故障报告.md) —— 开抢瞬间服务器崩溃的完整记录，以及为什么「响应码不可信」。
+
 ---
 
 ## 目录
@@ -22,6 +24,7 @@
 9. [不用菜单也能跑](#不用菜单也能跑)
 10. [常见问题](#常见问题)
 11. [文件说明](#文件说明)
+12. [调用方高可用与可靠性体系](#调用方高可用与可靠性体系)
 
 ---
 
@@ -430,17 +433,72 @@ refreshToken 死了。模拟器里重新登录 App，然后跑 `[9]`。
 lejianPE/
 ├─ run.bat                 入口，双击运行
 ├─ menu.py                 中文菜单
-├─ lejian.py               主程序（所有逻辑）
+├─ lejian.py               主程序入口与 CLI
 ├─ config.json             抢课规则配置 ← 你要改的就是这个
-├─ state.json              登录凭据（含 token，别外传）
+├─ state.json              登录凭据（含 token，已 gitignore）
 ├─ timetable.json          课表数据（由 md 生成）
+├─ core/                   可靠性工程核心模块
+│  ├─ instance_lock.py     单实例 OS 文件锁
+│  ├─ state_store.py       SQLite 状态机持久化 (registration_records)
+│  ├─ audit_logger.py      独立请求与事件审计日志 (脱敏)
+│  ├─ retry_policy.py      指数退避与服务健康状态探测
+│  ├─ request_manager.py   查询与提交请求解耦分类
+│  ├─ registration_manager.py 报名闭环与即时状态复核
+│  ├─ recovery_manager.py  启动异常状态扫描与对账恢复
+│  └─ reconciliation.py    结束与满额全局状态核对及超额告警
+├─ data/                   运行状态存储（已 gitignore）
+│  ├─ grab.lock            抢课单实例锁
+│  └─ registration.db      SQLite 报名状态数据库
+├─ tests/                  自动化测试套件
+│  └─ test_reliability.py  覆盖 T01~T15 场景的可靠性单元测试
 ├─ captures/               抓包与接口快照
-├─ logs/                   运行日志
+├─ logs/                   运行日志、请求审计与事件记录
 └─ tools/
    ├─ build_timetable.py   课表 md → timetable.json
    ├─ resync_from_app.py   从模拟器重新拿 token
-   └─ 其余                  开发期用的探测/测试脚本，日常不用管
+   ├─ cancel_one.py        精确退课工具
+   └─ 其余                  故障分析与开发期探测脚本
 ```
+
+---
+
+## 调用方高可用与可靠性体系
+
+> 核心设计原则：**宁可少发，不可重复；发完必复核。**
+
+针对学校服务器在瞬时并发下的网关回程失败（如 502/503）、高延迟超时（15s）、多实例并发提交等恶劣场景，系统构建了完整的可靠性闭环：
+
+### 1. 报名状态机与 SQLite 持久化
+- **状态流转**：`PENDING` → `SUBMITTING` → `SUCCESS` / `FAILED` / `UNKNOWN` → `VERIFYING` → `SUCCESS` / `RETRYABLE`
+- **提交前事务保护**：提交请求发送前必须先在本地 SQLite 中写入 `SUBMITTING`；
+- **响应不可信保护**：遇到 500、502、503、-1 超时或异常响应时，状态置为 `UNKNOWN`，**严禁直接重试**；系统立即触发 `isRegister` 服务端真实状态复核；若服务端已确认落库则升级为 `SUCCESS`，若确认未落库且满足规则才置为 `RETRYABLE`。
+- **本地去重**：本地已是 `SUCCESS` 的活动绝对不重复发起提交。
+
+### 2. 操作系统级单实例锁
+- 使用 OS 级文件锁（Windows 下为 `msvcrt.locking`，POSIX 下为 `fcntl.flock`）；
+- `grab` 与 `grab now` 必须获得锁才允许启动，彻底解决多个进程同时提交导致突破每周上限的问题；
+- 程序异常崩溃或被终止时，操作系统自动回收文件句柄并释放锁，绝不会因为遗留 lock 文件导致无法启动。
+
+### 3. 指数退避与健康状态机
+- 系统维护服务健康状态：`NORMAL`（正常）、`DEGRADED`（降级退避）、`RECOVERING`（恢复对账中）；
+- 查询接口连续失败触发指数退避：`delay = min(max_delay, base_delay * 2^(fail-1)) + jitter`；
+- 收到 HTTP 429 优先遵守 `Retry-After` 要求，避免给服务器雪上加霜。
+
+### 4. 崩溃恢复与最终全局核对
+- **启动恢复**：程序启动时主动扫描 SQLite 中未决状态（`SUBMITTING`、`UNKNOWN`、`VERIFYING`），逐一向服务端求证真实状态，恢复为 `SUCCESS` 或 `RETRYABLE`；
+- **全局核对**：当单周满额或观察窗口结束时，拉取服务端最终已报活动列表，按教学周和日期核实 `isRegister`；
+- **超额告警**：若发现因服务端并发放行导致报名超过 `max_normal` 或 `max_per_day`，立即在终端与日志中发出显著告警，并彻底阻断后续提交，提示用户使用 `tools/cancel_one.py` 人工确认退课。
+
+### 5. 独立请求审计日志
+- 写入 `logs/requests-YYYYMMDD.jsonl`，记录每次报名操作的完整耗时、HTTP 状态、业务状态、是否复核与最终状态；
+- 敏感数据自动脱敏：不记录 Token、学号、手机号与姓名。
+
+### 6. 运行自动化测试
+无需真实学校服务器凭据，直接运行完整测试套件：
+```bash
+python tests/test_reliability.py
+```
+覆盖 T01~T15 全部 15 种故障注入与可靠性测试（包含 503 复核成功、超时复核未知、多实例竞争、崩溃恢复、退避等）。
 
 ### 关于 state.json 的安全
 

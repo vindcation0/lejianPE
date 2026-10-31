@@ -18,9 +18,24 @@
 import json, os, re, ssl, sys, time, datetime, urllib.request, urllib.error, urllib.parse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from core.instance_lock import InstanceLock, InstanceLockError
+from core.state_store import StateStore, RegistrationStatus, StateStoreError
+from core.audit_logger import AuditLogger
+from core.retry_policy import RetryPolicy, HealthState
+from core.request_manager import RequestManager, SubmitResult
+from core.registration_manager import RegistrationManager
+from core.recovery_manager import RecoveryManager
+from core.reconciliation import ReconciliationManager
+
 BASE = "https://cpes.legym.cn/"
 STATE = os.path.join(ROOT, "state.json")
 CONFIG = os.path.join(ROOT, "config.json")
+DATA_DIR = os.path.join(ROOT, "data")
+DB_PATH = os.path.join(DATA_DIR, "registration.db")
+LOCK_PATH = os.path.join(DATA_DIR, "grab.lock")
 CAPTURES = os.path.join(ROOT, "captures")
 LOGS = os.path.join(ROOT, "logs")
 SSL_CTX = ssl.create_default_context()
@@ -62,7 +77,7 @@ def log(msg):
 
 # ---------------------------------------------------------------- HTTP
 def _request(method, path, params=None, body=None, form=False, auth=True,
-             token=None, school_id=None):
+             token=None, school_id=None, timeout=15):
     url = path if path.startswith("http") else BASE + path
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
@@ -81,7 +96,7 @@ def _request(method, path, params=None, body=None, form=False, auth=True,
 
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
             return r.status, dec(r.read())
     except urllib.error.HTTPError as e:
         return e.code, dec(e.read())
@@ -122,34 +137,75 @@ class Client:
             self.refresh()
         return self.s["accessToken"]
 
-    def post(self, path, body):
+    def post(self, path, body, timeout=15):
         self.ensure_token()
-        return _request("POST", path, body=body,
+        return _request("POST", path, body=body, timeout=timeout,
                         token=self.s["accessToken"], school_id=self.s["schoolId"])
 
-    def get(self, path, params=None):
+    def get(self, path, params=None, timeout=15):
         self.ensure_token()
-        return _request("GET", path, params=params,
+        return _request("GET", path, params=params, timeout=timeout,
                         token=self.s["accessToken"], school_id=self.s["schoolId"])
 
-    def call(self, method, path, body=None):
-        code, text = (self.post(path, body) if method == "POST"
-                      else self.get(path, body))
+    def call(self, method, path, body=None, timeout=15):
+        code, text = (self.post(path, body, timeout) if method == "POST"
+                      else self.get(path, body, timeout))
         try:
             return code, json.loads(text)
         except Exception:
             return code, {"_raw": text}
 
     # ---- 活动 ----
-    def activities(self, page_size=100):
-        """拉全部报名中的活动（分页）"""
+    def _note_fail(self, code):
+        """只在状态变化时记录，避免刷屏；用于事后还原故障时段"""
+        if getattr(self, "_last_fail", None) != code:
+            self._last_fail = code
+            self._fail_since = datetime.datetime.now()
+            log(f"  [列表异常] HTTP {code}，开始记录")
+            try:
+                line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
+                                   "event": "list_fail", "http": code},
+                                  ensure_ascii=False)
+                os.makedirs(LOGS, exist_ok=True)
+                with open(os.path.join(LOGS, f"events-{datetime.date.today():%Y%m%d}.jsonl"),
+                          "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+
+    def _note_ok(self):
+        if getattr(self, "_last_fail", None) is not None:
+            since = getattr(self, "_fail_since", None)
+            dur = (datetime.datetime.now() - since).total_seconds() if since else 0
+            log(f"  [列表恢复] 中断约 {dur:.0f} 秒")
+            self._last_fail = None
+            try:
+                line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
+                                   "event": "list_ok", "outage_sec": round(dur)},
+                                  ensure_ascii=False)
+                with open(os.path.join(LOGS, f"events-{datetime.date.today():%Y%m%d}.jsonl"),
+                          "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+
+    def activities(self, page_size=200, req_timeout=6):
+        """一次拉 200 条，避免分页多次往返"""
         out, page = [], 1
         while page <= 10:
-            code, obj = self.call("POST", "education/app/activity/getActivityList",
-                                  {"state": 1, "page": page, "size": page_size,
-                                   "semesterId": self.s["semesterId"]})
+            code, obj = None, None
+            for _ in range(3):
+                code, obj = self.call("POST", "education/app/activity/getActivityList",
+                                      {"state": 1, "page": page, "size": page_size,
+                                       "semesterId": self.s["semesterId"]},
+                                      timeout=req_timeout)
+                if code == 200 and isinstance(obj, dict) and obj.get("code") == 0:
+                    break
+                time.sleep(0.25)
             if code != 200 or not isinstance(obj, dict):
+                self._note_fail(code)
                 break
+            self._note_ok()
             d = obj.get("data") or {}
             items = d.get("items") or []
             for it in items:
@@ -165,7 +221,7 @@ class Client:
 
     def check_conflict(self, activity_id):
         code, obj = self.call("GET", "education/app/activity/checkConflict",
-                              {"activityId": activity_id})
+                              {"activityId": activity_id}, timeout=4)
         if code != 200 or not isinstance(obj, dict):
             return None
         return bool(obj.get("data"))
@@ -413,7 +469,10 @@ def cmd_status():
     log(f"token 剩余 {int(sec)} 秒 (约 {sec/3600:.1f} 小时)")
     if sec < 0:
         log("已过期，尝试刷新…")
-        c.refresh()
+        try:
+            c.refresh()
+        except Exception as e:
+            log(f"刷新失败: {e}，请在 App 中登录并重新同步")
     else:
         log("有效")
 
@@ -422,7 +481,11 @@ def cmd_list():
     st = load_json(STATE)
     cfg = load_json(CONFIG, {})
     c = Client(st)
-    c.ensure_token()
+    try:
+        c.ensure_token()
+    except Exception as e:
+        log(f"[Token 警告] 无法拉取活动列表 (Token 刷新失败: {e})，请先重新同步 Token。")
+        return
     items = c.activities()
     tt = load_timetable()
     cw = current_week(cfg, tt)
@@ -474,15 +537,58 @@ def next_sunday(hh, mm, ss=0):
 def cmd_grab():
     cfg = load_json(CONFIG, {})
     st = load_json(STATE)
+    if not st:
+        sys.exit("没有 state.json，请先登录并跑 tools/make_state.py 或 tools/resync_from_app.py")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    lock = InstanceLock(LOCK_PATH)
+    if not lock.acquire():
+        log("[错误] 已有抢课进程正在运行，拒绝启动第二个抢课实例！")
+        return
+
+    try:
+        _cmd_grab_inner(cfg, st)
+    finally:
+        lock.release()
+
+
+def _cmd_grab_inner(cfg, st):
     c = Client(st)
-    c.ensure_token()
+    test_mode = "test" in sys.argv[2:]
+    now_mode = "now" in sys.argv[2:]
+
+    try:
+        c.ensure_token()
+    except Exception as e:
+        log(f"[Token 警告] 自动刷新 Token 失败: {e}")
+        if not test_mode:
+            log("请先重新登录或同步有效 Token (使用 tools/resync_from_app.py 或 tools/make_state.py)！")
+            return
+
+    # 初始化可靠性系统
+    state_store = StateStore(DB_PATH)
+    audit_logger = AuditLogger(LOGS)
+    retry_policy = RetryPolicy(base_delay=0.5, max_delay=8.0)
+    req_mgr = RequestManager(c, retry_policy)
+    reg_mgr = RegistrationManager(state_store, req_mgr, audit_logger)
+    recovery_mgr = RecoveryManager(state_store, req_mgr, audit_logger)
+
+    # 1. 启动对账与异常恢复
+    log("正在执行启动状态对账与未决记录恢复…")
+    rec_sum = recovery_mgr.recover_on_startup()
+    if rec_sum["recovered_success"]:
+        log(f"  [启动恢复] 发现 {len(rec_sum['recovered_success'])} 条历史未决记录已在服务端成功：")
+        for r in rec_sum["recovered_success"]:
+            log(f"    - {r.get('activity_name')} (id={r.get('activity_id')})")
+    if rec_sum["marked_retryable"]:
+        log(f"  [启动恢复] 发现 {len(rec_sum['marked_retryable'])} 条历史未决记录经复核未报名，已转为可重试。")
+    if rec_sum["remained_unknown"]:
+        log(f"  [启动恢复] {len(rec_sum['remained_unknown'])} 条记录暂无法确认状态，保持 UNKNOWN。")
 
     max_normal = int(cfg.get("max_normal", 2))
     dry = bool(cfg.get("dry_run", True))
     poll = max(int(cfg.get("poll_interval_ms", 500)), 300) / 1000
     retry_cool = 3.0
-    test_mode = "test" in sys.argv[2:]
-    now_mode = "now" in sys.argv[2:]
 
     if test_mode:
         dry = True          # 自检模式绝不提交
@@ -525,10 +631,13 @@ def cmd_grab():
         polls += 1
         try:
             c.ensure_token(300)
-            items = c.activities()
+            items = c.activities(page_size=200, req_timeout=6)
+            retry_policy.record_success()
         except Exception as e:
-            log(f"  拉取活动失败: {e}")
-            time.sleep(poll)
+            retry_policy.record_failure()
+            backoff_delay = retry_policy.get_backoff_delay()
+            log(f"  拉取活动失败: {e} [健康状态: {retry_policy.state}]，退避 {backoff_delay:.2f} 秒")
+            retry_policy.sleep_backoff()
             continue
 
         # 每个教学周已报的普通活动数（跨周互不干扰）
@@ -556,14 +665,14 @@ def cmd_grab():
         if not open_now:
             if polls % 20 == 0:
                 log(f"  ...轮询中（第 {polls} 次，活动 {len(items)} 条，"
-                    f"已报 {dict(sorted(reg_by_week.items()))}")
+                    f"已报 {dict(sorted(reg_by_week.items()))}）")
             time.sleep(poll)
             continue
 
         acted = False
         cap_blocked = 0
         for pri, it, why in open_now:
-            aid, name = it.get("id"), it.get("name")
+            aid, name = str(it.get("id")), it.get("name")
             a_slot = activity_slot(it)
             spec = is_special(it, cfg)
             wk = week_of_item(it)
@@ -584,15 +693,30 @@ def cmd_grab():
             last_try[aid] = time.time()
             acted = True
 
-            try:
-                if c.check_conflict(aid):
-                    log(f"  服务端判定冲突，跳过 {name}")
-                    continue
-            except Exception:
-                pass
+            # 规则二次校验回调
+            def validate_rules(act_item):
+                now_check_ms = time.time() * 1000
+                st_reg = int(act_item.get("startRegisterTime") or 0)
+                en_reg = int(act_item.get("endRegisterTime") or 0)
+                if st_reg > now_check_ms or (en_reg and en_reg < now_check_ms):
+                    return False, "活动不在报名时间窗口内"
+                if remaining(act_item) == 0:
+                    return False, "名额已满"
+                if cfg.get("exclude_member", True) and is_member_only(act_item):
+                    return False, "会员制活动"
+                if cfg.get("check_conflict", True):
+                    try:
+                        if c.check_conflict(act_item.get("id")):
+                            return False, "服务端判定冲突"
+                    except Exception:
+                        pass
+                return True, "OK"
 
-            ok, reason, _ = c.sign_up(aid)
-            log(f"  报名 {name} -> {reason}")
+            ok, final_status, reason, final_item = reg_mgr.register_activity(
+                it, validate_rules_cb=validate_rules
+            )
+            log(f"  报名 {name} -> [{final_status}] {reason}")
+
             if ok:
                 d = datetime.date.fromtimestamp(int(it["startTime"]) / 1000)
                 if spec:
@@ -610,10 +734,33 @@ def cmd_grab():
             return
 
         if cap_blocked == len(open_now) and not any(is_special(p[1], cfg) for p in open_now):
-            log(f"本周 {max_normal} 节名额已满，退出")
-            return
+            log(f"本周 {max_normal} 节名额已满，开始最终全局对账…")
+            break
 
         time.sleep(poll)
+
+    # 抢课循环结束或满额时执行最终全局对账
+    reconciler = ReconciliationManager(c, cfg, tt, week_of)
+    report = reconciler.reconcile()
+    if report.get("success"):
+        log("================ 最终报名结果全局核对 ================")
+        log(f"服务端实际已报名 {report['total_registered']} 节（普通 {report['normal_registered']} 节，特殊 {report['special_registered']} 节）：")
+        for it in report.get("items", []):
+            st_ms = int(it.get("startTime") or 0)
+            a = activity_slot(it)
+            log(f"  - {fmt_ms(st_ms)}  {slot_text(a) if a else '?'}  {it.get('name')}  (id={it.get('id')})")
+        if report.get("exceeded"):
+            log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            log("  [严重超额告警] 服务端实际报名已超过上限！")
+            for w, cnt in report.get("exceeded_weeks", {}).items():
+                log(f"    第 {w} 周报名 {cnt} 节，超过限制 {max_normal} 节！")
+            for d_str, cnt in report.get("exceeded_days", {}).items():
+                log(f"    日期 {d_str} 报名 {cnt} 节，超过限制 {cfg.get('max_per_day', 1)} 节！")
+            log("  调用方已阻断任何后续提交。请运行 tools/cancel_one.py 人工确认退课。")
+            log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        else:
+            log("  核对通过：实际报名未超出配置上限。")
+        log("======================================================")
 
     log(f"观察窗口结束。本次抢到 {sum(week_done.values())} 节，额外 {special_done} 节")
 
@@ -638,8 +785,15 @@ def cmd_refresh():
 def cmd_names():
     """列出所有非会员课程名，方便填 config.json 的 targets"""
     cfg = load_json(CONFIG, {})
-    c = Client(load_json(STATE))
-    c.ensure_token()
+    st = load_json(STATE)
+    if not st:
+        sys.exit("没有 state.json")
+    c = Client(st)
+    try:
+        c.ensure_token()
+    except Exception as e:
+        log(f"[Token 警告] 无法拉取课程列表 (Token 刷新失败: {e})，请先重新同步 Token。")
+        return
     items = c.activities()
     normal = [i for i in items if not is_member_only(i)]
     groups = {}
@@ -665,17 +819,22 @@ def cmd_timetable():
     cw = current_week(cfg, tt)
     log(f"当前第 {cw} 教学周（第 1 周周一 = {tt['week1_monday']}，共 {len(tt.get('courses') or [])} 门课）")
 
-    c = Client(load_json(STATE))
-    c.ensure_token()
     reg = {}
-    for i in c.activities():
-        if not i.get("isRegister"):
-            continue
-        a = activity_slot(i)
-        if a is None:
-            continue
-        w = week_of(datetime.date.fromtimestamp(int(i["startTime"]) / 1000), tt)
-        reg.setdefault(w, []).append((a, "已抢:" + (i.get("name") or "")))
+    st = load_json(STATE)
+    if st:
+        c = Client(st)
+        try:
+            c.ensure_token()
+            for i in c.activities():
+                if not i.get("isRegister"):
+                    continue
+                a = activity_slot(i)
+                if a is None:
+                    continue
+                w = week_of(datetime.date.fromtimestamp(int(i["startTime"]) / 1000), tt)
+                reg.setdefault(w, []).append((a, "已抢:" + (i.get("name") or "")))
+        except Exception as e:
+            log(f"（未能联网拉取已报活动: {e}，展示本地课表）")
 
     for w in (cw, cw + 1):
         busy = busy_for_week(cfg, tt, w) + reg.get(w, [])

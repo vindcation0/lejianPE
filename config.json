@@ -11,7 +11,7 @@
     "乒乓球",
     "足球"
   ],
-  "special": ["体质健康测试"],
+  "special": [],
   "exclude_member": true,
   "max_normal": 2,
   "max_per_day": 1,
@@ -20,5 +20,7 @@
   "watch_until": "16:00:00",
   "poll_interval_ms": 500,
   "dry_run": true,
-  "busy_slots": []
+  "busy_slots": [],
+  "now_seconds": 120,
+  "check_conflict": true
 }
