@@ -12,6 +12,7 @@ data/
 *.db-wal
 *.db-shm
 *.lock
+*.bak
 __pycache__/
 *.pyc
 *.pyo

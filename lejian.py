@@ -309,13 +309,21 @@ DAY_DONE = {}       # 本次运行中每天已抢节数：date -> n
 
 
 def load_timetable():
-    tt = load_json(TIMETABLE) or {"current_week": 8, "courses": []}
-    if not tt.get("week1_monday"):
-        cw = int(tt.get("current_week") or 8)
-        today = datetime.date.today()
-        monday = today - datetime.timedelta(days=today.weekday())
-        tt["week1_monday"] = (monday - datetime.timedelta(days=7 * (cw - 1))).isoformat()
-    return tt
+    import timetable
+    tt_obj = timetable.load_timetable_file(TIMETABLE)
+    d = tt_obj.to_dict()
+    # 兼容可能还在读 courses 的旧脚本
+    d["courses"] = [
+        {
+            "name": s.label,
+            "weekday": s.weekday,
+            "start": s.start,
+            "end": s.end,
+            "weeks": s.weeks
+        }
+        for s in tt_obj.busy_slots
+    ]
+    return d
 
 
 def current_week(cfg, tt):
@@ -342,13 +350,27 @@ def busy_for_week(cfg, tt, week):
             busy.append((s, item))
         else:
             log(f"  [警告] busy_slots 无法解析: {item!r}")
-    for c in tt.get("courses") or []:
-        if any(a <= week <= b for a, b in (c.get("weeks") or [])):
+
+    # 支持 Schema v2 的 busy_slots
+    for slot in tt.get("busy_slots") or []:
+        if any(a <= week <= b for a, b in (slot.get("weeks") or [])):
             try:
-                busy.append(((c["weekday"], hhmm(c["start"]), hhmm(c["end"])),
-                             f"{c['name']}（第{week}周）"))
+                label = slot.get("label") or "课表占用"
+                busy.append(((slot["weekday"], hhmm(slot["start"]), hhmm(slot["end"])),
+                             f"{label}（第{week}周）"))
             except Exception:
                 pass
+
+    # 兼容旧版 courses（若未包含 busy_slots）
+    if not tt.get("busy_slots"):
+        for c in tt.get("courses") or []:
+            if any(a <= week <= b for a, b in (c.get("weeks") or [])):
+                try:
+                    busy.append(((c["weekday"], hhmm(c["start"]), hhmm(c["end"])),
+                                 f"{c.get('name', '课表占用')}（第{week}周）"))
+                except Exception:
+                    pass
+
     for wk, s, why in EXTRA:
         if wk == week:
             busy.append((s, why))
@@ -843,11 +865,17 @@ def cmd_timetable():
             log(f"  {slot_text(s)}  <- {why}")
 
 
+def cmd_editor():
+    """启动本地可视化课表编辑器"""
+    from tools.editor_server import run_editor
+    run_editor()
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     {"status": cmd_status, "list": cmd_list, "grab": cmd_grab,
      "timetable": cmd_timetable, "names": cmd_names,
-     "refresh": cmd_refresh}.get(cmd, cmd_status)()
+     "refresh": cmd_refresh, "editor": cmd_editor}.get(cmd, cmd_status)()
 
 
 if __name__ == "__main__":

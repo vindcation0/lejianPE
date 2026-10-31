@@ -118,41 +118,40 @@
 ## 第二步：配置课表
 
 程序需要知道你的**真实课表**，才能判断抢到的课会不会撞课。
+课表存储在 `timetable.json` 中，只记录你被占用的时段（星期、时间、生效周次），不保留任何无用的课程名称或教师信息。
 
-课表来自 `timetable.json`，由学校导出的 markdown 生成。
+### 方式 A（推荐）：网页可视化编辑器
 
-### 生成方法
+双击 `run.bat` 选择 **`[t] 可视化编辑课表（网页版）`**，或运行：
+
+```bash
+python lejian.py editor
+```
+
+1. 程序会自动在本地启动安全的 HTTP 服务（仅监听 `127.0.0.1`，带随机会话 Token）并打开浏览器。
+2. 页面展示直观的二维课表网格（星期一至星期日 × 时间段）。
+3. 支持选择**每周、单周、双周或自定义周次**画笔，直接在格子上点击即可标记有课。
+4. 支持自由添加、修改或删除时间段行（无需死记 45 或 90 分钟）。
+5. 支持按周过滤预览（如对比第 8 周与第 9 周的占用差异）。
+6. 编辑完成后点击「💾 保存课表」，系统自动执行数据格式校验并原子更新 `timetable.json`（自动备份旧课表为 `.bak`）。
+
+### 方式 B（进阶）：从 Markdown 转换
+
+如果你已有学校导出的 Markdown 课表文件，也可以直接转换：
 
 ```bash
 python tools\build_timetable.py "C:\Users\你\Downloads\course_schedule.md" 8
 ```
 
 - 第一个参数：课表 markdown 路径
-- 第二个参数：**当前教学周**（写错会导致周次判断错位）
-
-输出：
-
-```
-解析 15 条，写入 ...\timetable.json
-
-  周1 09:55-12:20  [1-16周]  概率论与数理统计A_37
-  周1 14:00-15:35  [1-16周]  大学体育III_24
-  周2 08:00-09:35  [1-8周]  国家安全教育_30
-  ...
-```
+- 第二个参数：**当前教学周**（用于换算第 1 周周一日期锚点）
 
 ### 周次感知
 
-课表里 `1-8周`、`5-12周`、`1-4周` 这类周次会被保留。程序按**活动自己所在的周**去比对，所以：
+课表里 `1-8周`、`5-12周`、`单周` 这类周次会被严格保留并比对，所以：
 
-- 第 8 周：周二早上被《国家安全教育》占着
-- 第 9 周：那门课已结课，周二早上空出来
-
-同一个时段在不同周结论不同，这是刻意做的。
-
-### 换学期或课表变了
-
-重新跑一次 `build_timetable.py` 即可，同时把 `config.json` 里的 `current_week` 改成当前周。
+- 第 8 周：周二早上被 1-8 周课程占着，程序判定冲突跳过；
+- 第 9 周：该课程已结课，同一时段自动判定为可抢。
 
 ---
 
@@ -436,7 +435,13 @@ lejianPE/
 ├─ lejian.py               主程序入口与 CLI
 ├─ config.json             抢课规则配置 ← 你要改的就是这个
 ├─ state.json              登录凭据（含 token，已 gitignore）
-├─ timetable.json          课表数据（由 md 生成）
+├─ timetable.json          课表数据 (Schema v2 busy_slots)
+├─ timetable/              课表时间占用模型与校验模块
+│  ├─ models.py            TimeSlot 与 Timetable 数据模型
+│  ├─ normalizer.py        星期、时间、周次标准化
+│  ├─ validator.py         课表完整性与业务规则严格校验
+│  ├─ compatibility.py     Schema v1/v2 兼容、自动探测与安全迁移
+│  └─ editor.html          本地可视化课表编辑器前端单页
 ├─ core/                   可靠性工程核心模块
 │  ├─ instance_lock.py     单实例 OS 文件锁
 │  ├─ state_store.py       SQLite 状态机持久化 (registration_records)
@@ -450,10 +455,12 @@ lejianPE/
 │  ├─ grab.lock            抢课单实例锁
 │  └─ registration.db      SQLite 报名状态数据库
 ├─ tests/                  自动化测试套件
-│  └─ test_reliability.py  覆盖 T01~T15 场景的可靠性单元测试
+│  ├─ test_reliability.py  覆盖 T01~T15 可靠性场景测试
+│  └─ test_timetable.py    覆盖 T01~T18 课表与编辑器 API 测试
 ├─ captures/               抓包与接口快照
 ├─ logs/                   运行日志、请求审计与事件记录
 └─ tools/
+   ├─ editor_server.py     本地可视化课表编辑器 HTTP 服务
    ├─ build_timetable.py   课表 md → timetable.json
    ├─ resync_from_app.py   从模拟器重新拿 token
    ├─ cancel_one.py        精确退课工具

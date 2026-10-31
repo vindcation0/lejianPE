@@ -13,6 +13,7 @@ ACTIONS = [
     ("4", "立即抢课（不等周日）", ["lejian.py", "grab", "now"]),
     ("5", "自检 20 秒（不会提交）", ["lejian.py", "grab", "test"]),
     ("6", "查看课表与周次", ["lejian.py", "timetable"]),
+    ("t", "可视化编辑课表（网页版）", ["tools/editor_server.py"]),
     ("7", "查看所有课程名（填配置用）", ["lejian.py", "names"]),
     ("8", "强制刷新 token", ["lejian.py", "refresh"]),
     ("9", "从模拟器 App 重新同步 token", ["tools/resync_from_app.py"]),

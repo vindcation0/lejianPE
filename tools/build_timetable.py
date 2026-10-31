@@ -88,12 +88,29 @@ def main():
     today = datetime.date.today()
     monday = today - datetime.timedelta(days=today.weekday())
     week1 = monday - datetime.timedelta(days=7 * (week - 1))
-    data = {"source": os.path.basename(src), "current_week": week,
-            "week1_monday": week1.isoformat(), "courses": courses}
+    
+    # 构建 Schema v2 busy_slots
+    busy_slots = []
+    for c in courses:
+        busy_slots.append({
+            "weekday": c["weekday"],
+            "start": c["start"],
+            "end": c["end"],
+            "weeks": c["weeks"]
+        })
+
+    data = {
+        "schema_version": 2,
+        "source": os.path.basename(src),
+        "current_week": week,
+        "week1_monday": week1.isoformat(),
+        "busy_slots": busy_slots,
+        "courses": courses  # 保持向下兼容视图
+    }
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    print(f"解析 {len(courses)} 条，写入 {OUT}\n")
+    print(f"解析 {len(courses)} 条，生成 {len(busy_slots)} 条时间占用段，写入 {OUT}\n")
     for c in courses:
         wk = ",".join(f"{a}-{b}" for a, b in c["weeks"])
         print(f"  周{c['weekday']} {c['start']}-{c['end']}  [{wk}周]  {c['name']}")
