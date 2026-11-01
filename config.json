@@ -18,8 +18,9 @@
   "watch_from": "13:59:00",
   "watch_until": "16:00:00",
   "poll_interval_ms": 500,
-  "dry_run": true,
+  "dry_run": false,
   "busy_slots": [],
-  "now_seconds": 120,
-  "check_conflict": true
+  "now_seconds": 2400,
+  "check_conflict": true,
+  "current_week": 9
 }
