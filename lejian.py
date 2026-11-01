@@ -1047,6 +1047,12 @@ def cmd_login():
     login_main()
 
 
+def cmd_reinit():
+    """重新初始化认证（一键重新抓取、验证并更新凭据与会话）"""
+    from core.auth_initializer import AuthInitializer
+    AuthInitializer().reinitialize()
+
+
 def cmd_refresh():
     """强制刷新 token（不等过期）"""
     st = load_json(STATE)
@@ -1166,7 +1172,7 @@ def main():
     {"status": cmd_status, "list": cmd_list, "grab": cmd_grab,
      "timetable": cmd_timetable, "names": cmd_names,
      "refresh": cmd_refresh, "editor": cmd_editor,
-     "login": cmd_login}.get(cmd, cmd_status)()
+     "login": cmd_login, "reinit": cmd_reinit}.get(cmd, cmd_status)()
 
 
 if __name__ == "__main__":

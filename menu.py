@@ -17,7 +17,7 @@ ACTIONS = [
     ("7", "查看所有课程名（填配置用）", ["lejian.py", "names"]),
     ("8", "强制刷新 token", ["lejian.py", "refresh"]),
     ("9", "账号密码登录（命令行·主要方式）", ["lejian.py", "login"]),
-    ("b", "重新抓取登录签名（改密码后用）", ["tools/capture_login.py"]),
+    ("b", "重新初始化认证（一键修复凭据与会话）", ["lejian.py", "reinit"]),
     ("a", "从模拟器 App 同步 Token（备用方案）", ["tools/resync_from_app.py"]),
 ]
 

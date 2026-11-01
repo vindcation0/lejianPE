@@ -848,8 +848,11 @@ def handle_login_failure(
                 if on_reinit:
                     on_reinit()
                 else:
-                    print("\n提示：当前一键初始化功能可通过菜单 [b] 重新抓取签名，")
-                    print("或运行：python tools\\capture_login.py")
+                    try:
+                        from core.auth_initializer import AuthInitializer
+                        AuthInitializer().reinitialize()
+                    except Exception as e:
+                        print(f"\n启动重新初始化失败: {e}")
             elif report.can_retry:
                 print("\n请返回主菜单后重新尝试登录。")
             else:
