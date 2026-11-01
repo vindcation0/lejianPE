@@ -19,6 +19,7 @@ ACTIONS = [
     ("9", "账号密码登录（命令行·主要方式）", ["lejian.py", "login"]),
     ("b", "重新初始化认证（一键修复凭据与会话）", ["lejian.py", "reinit"]),
     ("s", "系统配置向导（环境自检与首次初始化）", ["lejian.py", "setup"]),
+    ("d", "系统健康体检（只读诊断报告）", ["lejian.py", "doctor"]),
     ("a", "从模拟器 App 同步 Token（备用方案）", ["tools/resync_from_app.py"]),
 ]
 

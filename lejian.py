@@ -1062,6 +1062,20 @@ def cmd_setup():
         sys.exit(1)
 
 
+def cmd_doctor():
+    """系统体检与只读健康诊断 (M4)"""
+    from core.system_doctor import SystemDoctor
+    is_json = "--json" in sys.argv
+    verbose = "-v" in sys.argv or "--verbose" in sys.argv
+    offline = "--offline" in sys.argv
+    doctor = SystemDoctor(root_dir=ROOT)
+    report = doctor.run_diagnostics(online_probe=(not offline))
+    if is_json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(report.format_report(verbose=verbose))
+
+
 def cmd_refresh():
     """强制刷新 token（不等过期）"""
     st = load_json(STATE)
@@ -1182,7 +1196,8 @@ def main():
      "timetable": cmd_timetable, "names": cmd_names,
      "refresh": cmd_refresh, "editor": cmd_editor,
      "login": cmd_login, "reinit": cmd_reinit,
-     "setup": cmd_setup, "wizard": cmd_setup}.get(cmd, cmd_status)()
+     "setup": cmd_setup, "wizard": cmd_setup,
+     "doctor": cmd_doctor, "--doctor": cmd_doctor}.get(cmd, cmd_status)()
 
 
 if __name__ == "__main__":
