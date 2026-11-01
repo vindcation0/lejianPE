@@ -1,7 +1,7 @@
 """
-乐健体育 · 首次配置向导与环境自检自动化测试套件 (W01 ~ W19).
+乐健体育 · 首次配置向导与环境自检自动化测试套件 (W01 ~ W23).
 ==============================================================
-覆盖执行计划 M3 (第三阶段) 全部验收指标与 7 类状态场景：
+覆盖执行计划 M3 (第三阶段) 全部验收指标与加固设计：
 1. detect_system_state 状态检测：
    - W01: NO_CONFIG (完全无配置)
    - W02: CRED_WITHOUT_STATE (有凭据无会话)
@@ -24,6 +24,10 @@
    - W17: NO_CONFIG 全新环境全流程开箱引导与落地
    - W18: 全流程敏感信息脱敏校验（绝不包含明文密码与完整 Token）
    - W19: lejian.py setup/wizard 与 menu.py 动作路由验证
+   - W20: 快速登录遇到 50004 签名错误自动引导重新初始化闭环
+   - W21: 静默刷新 Single-flight 单飞并发控制验证（防并发重复刷新与轮换冲突）
+   - W22: 静默刷新失败冷却保护（防无限快速重试打爆服务端）
+   - W23: 环境自检网络探测非阻断性验证（离线环境下仍放行本地查看）
 """
 import io
 import json
@@ -33,6 +37,8 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import MagicMock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -466,6 +472,152 @@ class ConfigWizardTestSuite(unittest.TestCase):
         with patch("core.config_wizard.ConfigWizard.run_wizard", return_value=True) as mock_wizard:
             lejian.cmd_setup()
             mock_wizard.assert_called_once()
+
+    # ==================== W20: 快速登录遇到 50004 签名错误引导闭环 ====================
+    def test_W20_quick_login_50004_signature_error_prompts_reinit_loop(self):
+        """W20: 快速登录遇到 50004 签名失效时（如改了密码），自动引导进入重新初始化闭环"""
+        self.wizard.initializer.storage.save_credential("13800138000", "sig_outdated", use_dpapi=False)
+
+        stdout_buf = io.StringIO()
+        with patch.object(self.wizard.auth_manager, "login", side_effect=BusinessAuthError("50004 签名校验失败", code=50004)), \
+             patch.object(self.wizard.initializer, "reinitialize", return_value=True) as mock_reinit, \
+             patch("builtins.input", return_value="1"), \
+             patch("sys.stdout", stdout_buf):
+            ok = self.wizard.quick_login_with_existing_credential(password="Pass123", interactive=True)
+            self.assertTrue(ok)
+            mock_reinit.assert_called_once()
+
+        out = stdout_buf.getvalue()
+        self.assertIn("闭环引导", out)
+        self.assertIn("当前凭据的签名可能已失效", out)
+
+    # ==================== W21: 静默刷新 Single-flight 单飞并发控制验证 ====================
+    def test_W21_silent_refresh_single_flight_concurrency(self):
+        """W21: 多个并发请求同时发现 Token 过期时，Single-flight 机制确保仅发起 1 次刷新请求，避免轮换冲突"""
+        import threading
+
+        ConfigWizard._last_failure_time = 0.0
+        ConfigWizard._last_failure_reason = ""
+
+        # 预设过期的 state.json
+        state_data = {
+            "accessToken": "tok_expired_old",
+            "refreshToken": "ref_valid_token",
+            "schoolId": "sch_123",
+            "semesterId": "sem_123",
+            "accessTokenExpires": int((time.time() - 100) * 1000),
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
+        # 统计向服务端发起真实 HTTP 请求的次数
+        http_call_count = [0]
+        original_urlopen = urllib.request.urlopen
+
+        class MockHttpResponse:
+            def __init__(self, data_bytes):
+                self.status = 200
+                self._data = data_bytes
+
+            def read(self):
+                return self._data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        def mock_urlopen_fn(req, *args, **kwargs):
+            if "refreshToken" in str(getattr(req, "full_url", req)):
+                http_call_count[0] += 1
+                # 模拟轻微网络耗时，放大并发重叠
+                time.sleep(0.05)
+                resp_payload = {
+                    "code": 0,
+                    "data": {
+                        "accessToken": "tok_singleflight_fresh_999",
+                        "refreshToken": "ref_rotated_new_token_888",
+                        "accessTokenExpires": int((time.time() + 3600) * 1000),
+                    }
+                }
+                return MockHttpResponse(json.dumps(resp_payload).encode("utf-8"))
+            return original_urlopen(req, *args, **kwargs)
+
+        threads = []
+        results = [None, None, None]
+
+        def worker(idx):
+            res_ok, res_str = self.wizard.silent_refresh_token()
+            results[idx] = (res_ok, res_str)
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen_fn):
+            for i in range(3):
+                t = threading.Thread(target=worker, args=(i,))
+                threads.append(t)
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # 核心断言：3 个并发请求全部刷新成功！
+        for i in range(3):
+            self.assertTrue(results[i][0], f"线程 {i} 刷新未能成功")
+
+        # 核心断言：向服务端实际仅发起了 1 次网络调用（Single-flight 成功避免了重复刷新与轮换冲突）！
+        self.assertEqual(http_call_count[0], 1, f"并发请求没有合并为单飞，实际触发了 {http_call_count[0]} 次请求！")
+
+        # 检查磁盘会话已经更新为最新的 Token
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        self.assertEqual(st["accessToken"], "tok_singleflight_fresh_999")
+        self.assertEqual(st["refreshToken"], "ref_rotated_new_token_888")
+
+    # ==================== W22: 静默刷新失败冷却保护 ====================
+    def test_W22_silent_refresh_cooldown_prevents_infinite_retries(self):
+        """W22: 静默刷新失败后触发冷却保护，短时间内的重试直接被拦截，防止打满服务端接口"""
+        ConfigWizard._last_failure_time = 0.0
+        ConfigWizard._last_failure_reason = ""
+
+        state_data = {
+            "accessToken": "tok_old",
+            "refreshToken": "ref_bad_token",
+            "accessTokenExpires": int((time.time() - 100) * 1000),
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
+        # 模拟第一次刷新遭遇 401
+        with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(None, 401, "Unauthorized", {}, None)):
+            ok1, err1 = self.wizard.silent_refresh_token()
+            self.assertFalse(ok1)
+            self.assertIn("401", err1)
+
+        # 紧接着第二次刷新（处于冷却期内）
+        # 哪怕这次 mock 成功，也会因为处于冷却保护直接返回冷却提示，绝不发起多余调用
+        with patch("urllib.request.urlopen") as mock_url:
+            ok2, err2 = self.wizard.silent_refresh_token()
+            self.assertFalse(ok2)
+            self.assertIn("刷新冷却保护中", err2)
+            mock_url.assert_not_called()
+
+        # 重置冷却时间，避免污染后续测试
+        ConfigWizard._last_failure_time = 0.0
+        ConfigWizard._last_failure_reason = ""
+
+    # ==================== W23: 环境自检网络探测非阻断性验证 ====================
+    def test_W23_environment_check_network_offline_non_blocking(self):
+        """W23: 模拟网络断网/DNS 解析失败/超时，验证报告正确记录网络警告，但 overall_ok 仍为 True（非阻断）"""
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("DNS resolution failed (Offline)")):
+            env_res = self.wizard.check_environment()
+            self.assertFalse(env_res["network_ok"])
+            self.assertIn("受限或未连接", env_res["network_desc"])
+            # 关键验证：网络不可用不会阻断本地基本功能的查看！
+            self.assertTrue(env_res["overall_ok"], "网络异常不应导致 overall_ok 失败（必须是非阻断式检测）")
+
+        report = self.wizard.format_environment_report(env_res)
+        self.assertIn("网络连通性", report)
+        self.assertIn("受限或未连接", report)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -72,6 +73,10 @@ class ConfigWizard:
     """
     负责新用户首次配置向导与环境自检。
     """
+    _singleflight_lock = threading.Lock()
+    _last_failure_time: float = 0.0
+    _last_failure_reason: str = ""
+    COOLDOWN_SECONDS: float = 10.0
 
     def __init__(
         self,
@@ -309,6 +314,28 @@ class ConfigWizard:
             adb_path = shutil.which("adb")
             adb_found = bool(adb_path)
 
+        # 6. 网络连通性探测 (向乐健服务器发送轻量探测请求，非阻断式)
+        network_ok = False
+        network_desc = ""
+        try:
+            probe_url = self.base_url.rstrip("/") + "/"
+            req = urllib.request.Request(probe_url, method="GET")
+            req.add_header("User-Agent", "okhttp/3.12.1")
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=3.0, context=ctx) as resp:
+                network_ok = True
+                network_desc = f"畅通 (连接正常, HTTP {resp.status})"
+        except urllib.error.HTTPError as e:
+            network_ok = True
+            network_desc = f"畅通 (服务端响应 HTTP {e.code})"
+        except urllib.error.URLError as e:
+            network_ok = False
+            network_desc = f"受限或未连接 ({e.reason})"
+        except Exception as e:
+            network_ok = False
+            network_desc = f"检测异常 ({e})"
+
+        # 注意：网络连接为非阻断式检测（离线环境下仍可查看本地课表与配置）
         return {
             "python_ok": py_ok,
             "python_version": py_desc,
@@ -320,6 +347,8 @@ class ConfigWizard:
             "sqlite_desc": sqlite_desc,
             "adb_found": adb_found,
             "adb_path": adb_path or "未检测到 (若已有凭据则无需模拟器)",
+            "network_ok": network_ok,
+            "network_desc": network_desc,
             "overall_ok": py_ok and all_dirs_ok and sqlite_ok,
         }
 
@@ -332,6 +361,7 @@ class ConfigWizard:
             f"Python 版本  : {env_report['python_version']} ({'符合要求' if env_report['python_ok'] else '过低，建议 >= 3.8'})",
             f"运行平台     : {sys.platform} ({'支持 Windows DPAPI 硬件级加密' if env_report['dpapi_supported'] else '标准 POSIX 安全模式'})",
             f"SQLite 驱动  : {env_report['sqlite_desc']}",
+            f"网络连通性   : {env_report['network_desc']}",
             f"安卓 ADB 工具: {env_report['adb_path']}",
             "-" * 55,
             "目录读写权限 :",
@@ -348,74 +378,103 @@ class ConfigWizard:
     def silent_refresh_token(self) -> Tuple[bool, Optional[str]]:
         """
         使用现有 state.json 中的 RefreshToken 静默延长会话。
-        成功返回 (True, expires_str) 并原子持久化；
-        失败返回 (False, error_reason)。
+        采用进程级 Single-flight 单飞互斥并发控制与 Double-Checked Locking：
+        1. 多个并发请求排队，仅首个请求穿透向服务端发起刷新调用；
+        2. 后续请求获得锁后直接检测复用新鲜 Token，防范 RefreshToken 轮换冲突与重复写盘；
+        3. 失败时触发冷却保护，防止短时间内无限重试打满接口。
         """
-        if not os.path.exists(self.state_path):
-            return False, "state.json 不存在"
+        with self._singleflight_lock:
+            # 1. 检查失败冷却保护
+            now = time.time()
+            if (now - ConfigWizard._last_failure_time) < ConfigWizard.COOLDOWN_SECONDS:
+                return False, f"刷新冷却保护中（请勿频繁重试）: {ConfigWizard._last_failure_reason}"
 
-        try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                st = json.load(f)
-        except Exception as e:
-            return False, f"读取 state.json 失败: {e}"
+            if not os.path.exists(self.state_path):
+                return False, "state.json 不存在"
 
-        rt = st.get("refreshToken")
-        if not rt or not str(rt).strip():
-            return False, "缺少 refreshToken"
+            try:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+            except Exception as e:
+                return False, f"读取 state.json 失败: {e}"
 
-        url = urllib.parse.urljoin(self.base_url, "authorization/user/refreshToken")
-        url_with_param = f"{url}?refreshToken={urllib.parse.quote(str(rt).strip())}"
-        req = urllib.request.Request(url_with_param, method="GET")
-        req.add_header("User-Agent", "okhttp/3.12.1")
+            # 2. 双重检查 (Double-Checked Locking)：确认前序并发是否已经刚完成过刷新
+            curr_exp = int(st.get("accessTokenExpires") or 0)
+            if curr_exp > (time.time() * 1000 + 30000) and st.get("accessToken"):
+                # 前序请求已经成功刷新过了，直接复用
+                exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(curr_exp / 1000))
+                return True, exp_str
 
-        ctx = ssl.create_default_context()
-        try:
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                code = resp.status
-                raw = resp.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as e:
-            return False, f"服务端拒绝刷新 (HTTP {e.code})"
-        except Exception as e:
-            return False, f"网络异常: {e}"
+            rt = st.get("refreshToken")
+            if not rt or not str(rt).strip():
+                return False, "缺少 refreshToken"
 
-        try:
-            res_json = json.loads(raw)
-        except Exception:
-            return False, "服务端响应非合法 JSON"
+            url = urllib.parse.urljoin(self.base_url, "authorization/user/refreshToken")
+            url_with_param = f"{url}?refreshToken={urllib.parse.quote(str(rt).strip())}"
+            req = urllib.request.Request(url_with_param, method="GET")
+            req.add_header("User-Agent", "okhttp/3.12.1")
 
-        if code != 200 or not isinstance(res_json, dict) or res_json.get("code") != 0:
-            msg = res_json.get("message") if isinstance(res_json, dict) else raw[:100]
-            return False, f"刷新失败 (code={res_json.get('code') if isinstance(res_json, dict) else code}): {msg}"
+            ctx = ssl.create_default_context()
+            try:
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                    code = resp.status
+                    raw = resp.read().decode("utf-8", "ignore")
+            except urllib.error.HTTPError as e:
+                err_msg = f"服务端拒绝刷新 (HTTP {e.code})"
+                ConfigWizard._last_failure_time = time.time()
+                ConfigWizard._last_failure_reason = err_msg
+                return False, err_msg
+            except Exception as e:
+                err_msg = f"网络异常: {e}"
+                ConfigWizard._last_failure_time = time.time()
+                ConfigWizard._last_failure_reason = err_msg
+                return False, err_msg
 
-        data = res_json.get("data")
-        if not isinstance(data, dict):
-            return False, "刷新响应缺少 data 结构"
+            try:
+                res_json = json.loads(raw)
+            except Exception:
+                err_msg = "服务端响应非合法 JSON"
+                ConfigWizard._last_failure_time = time.time()
+                ConfigWizard._last_failure_reason = err_msg
+                return False, err_msg
 
-        new_tok = data.get("accessToken")
-        new_rt = data.get("refreshToken") or rt
-        new_exp = int(data.get("accessTokenExpires") or 0)
+            if code != 200 or not isinstance(res_json, dict) or res_json.get("code") != 0:
+                msg = res_json.get("message") if isinstance(res_json, dict) else raw[:100]
+                err_msg = f"刷新失败 (code={res_json.get('code') if isinstance(res_json, dict) else code}): {msg}"
+                ConfigWizard._last_failure_time = time.time()
+                ConfigWizard._last_failure_reason = err_msg
+                return False, err_msg
 
-        if not new_tok or not str(new_tok).strip():
-            return False, "响应中缺少 accessToken"
+            data = res_json.get("data")
+            if not isinstance(data, dict):
+                return False, "刷新响应缺少 data 结构"
 
-        new_state = dict(st)
-        new_state["accessToken"] = str(new_tok).strip()
-        new_state["refreshToken"] = str(new_rt).strip()
-        new_state["accessTokenExpires"] = new_exp
+            new_tok = data.get("accessToken")
+            new_rt = data.get("refreshToken") or rt
+            new_exp = int(data.get("accessTokenExpires") or 0)
 
-        # 以原子安全方式写回
-        try:
-            self.auth_manager.save_state_atomically(
-                login_data=new_state,
-                state_path=self.state_path,
-                backup=True,
-            )
-            secure_file_permissions(self.state_path)
-            exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(new_exp / 1000)) if new_exp > 0 else "未知"
-            return True, exp_str
-        except Exception as e:
-            return False, f"原子化保存刷新后的会话失败: {e}"
+            if not new_tok or not str(new_tok).strip():
+                return False, "响应中缺少 accessToken"
+
+            new_state = dict(st)
+            new_state["accessToken"] = str(new_tok).strip()
+            new_state["refreshToken"] = str(new_rt).strip()
+            new_state["accessTokenExpires"] = new_exp
+
+            # 以原子安全方式写回
+            try:
+                self.auth_manager.save_state_atomically(
+                    login_data=new_state,
+                    state_path=self.state_path,
+                    backup=True,
+                )
+                secure_file_permissions(self.state_path)
+                ConfigWizard._last_failure_time = 0.0
+                ConfigWizard._last_failure_reason = ""
+                exp_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(new_exp / 1000)) if new_exp > 0 else "未知"
+                return True, exp_str
+            except Exception as e:
+                return False, f"原子化保存刷新后的会话失败: {e}"
 
     # =========================================================================
     # 四、快速登录初始化会话 (针对 CRED_WITHOUT_STATE 与 SESSION_EXPIRED)
@@ -481,8 +540,27 @@ class ConfigWizard:
             print("\n❌ 登录失败！")
             diag = diagnose_auth_error(e, context={"account": account, "stage": "quick_login"})
             print("\n" + diag.format_report(verbose=False))
+
+            # 闭环分流：若错误可重初始化（如 50004 签名失效或修改过密码导致签名不匹配），提供一键重初始化入口
+            if diag.can_reinit and interactive:
+                print("-" * 55)
+                print("💡 闭环引导：检测到当前凭据的签名可能已失效（例如修改了登录密码）。")
+                print("   无需担心！可以通过模拟器重新登录官方 App 重新采集签名修复。")
+                try:
+                    choice = input("是否现在开始重新初始化认证？[1] 是 (默认) / [2] 否: ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    return False
+                if choice not in ("2", "n", "no", "q"):
+                    return self.initializer.reinitialize(
+                        password=pwd,
+                        flows_path=self.flows_path,
+                        use_dpapi=self.use_dpapi,
+                        interactive=True,
+                    )
+
             return False
         finally:
+            # 及时释放局部变量引用以尽可能缩短密码在内存中的存活周期
             del pwd
 
     # =========================================================================
