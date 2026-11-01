@@ -29,6 +29,8 @@ from core.request_manager import RequestManager, SubmitResult
 from core.registration_manager import RegistrationManager
 from core.recovery_manager import RecoveryManager
 from core.reconciliation import ReconciliationManager
+from core.circuit_breaker import CircuitBreaker, CircuitState, is_server_fault
+from core.result_reporter import ResultReporter
 
 BASE = "https://cpes.legym.cn/"
 STATE = os.path.join(ROOT, "state.json")
@@ -671,6 +673,8 @@ def _cmd_grab_inner(cfg, st):
     state_store = StateStore(DB_PATH)
     audit_logger = AuditLogger(LOGS)
     retry_policy = RetryPolicy(base_delay=0.5, max_delay=8.0)
+    circuit_breaker = CircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0)
+    reporter = ResultReporter(run_date=datetime.date.today())
     req_mgr = RequestManager(c, retry_policy)
     reg_mgr = RegistrationManager(state_store, req_mgr, audit_logger)
     recovery_mgr = RecoveryManager(state_store, req_mgr, audit_logger)
@@ -686,6 +690,7 @@ def _cmd_grab_inner(cfg, st):
         log(f"  [启动恢复] 发现 {len(rec_sum['marked_retryable'])} 条历史未决记录经复核未报名，已转为可重试。")
     if rec_sum["remained_unknown"]:
         log(f"  [启动恢复] {len(rec_sum['remained_unknown'])} 条记录暂无法确认状态，保持 UNKNOWN。")
+        log("  [安全屏障] 检测到未决记录，安全屏障已冻结新的报名提交，优先执行复核！")
 
     max_normal = int(cfg.get("max_normal", 2))
     dry = bool(cfg.get("dry_run", True))
@@ -734,23 +739,77 @@ def _cmd_grab_inner(cfg, st):
 
     while datetime.datetime.now() < watch_until:
         polls += 1
+
+        # 检查服务端故障熔断状态 (C03, C04)
+        can_call, breaker_msg = circuit_breaker.can_attempt()
+        if not can_call:
+            log(f"  [熔断保护] {breaker_msg}，暂停高频轮询")
+            time.sleep(poll)
+            continue
+
         try:
             c.ensure_token(300)
             items = c.activities(page_size=200, req_timeout=6)
-            retry_policy.record_success()
         except Exception as e:
+            # 记录故障分类与熔断 (C01, C02)
+            http_code = getattr(e, "code", -1) if hasattr(e, "code") else -1
+            circuit_breaker.record_failure(http_status=http_code, error=e)
+            reporter.record_http_failure(http_code)
             retry_policy.record_failure()
             backoff_delay = retry_policy.get_backoff_delay()
-            log(f"  拉取活动失败: {e} [健康状态: {retry_policy.state}]，退避 {backoff_delay:.2f} 秒")
+            log(f"  拉取活动失败: {e} [熔断: {circuit_breaker.state}, 健康: {retry_policy.state}]，退避 {backoff_delay:.2f} 秒")
             retry_policy.sleep_backoff()
             continue
 
         if not getattr(items, "complete", True):
+            # C09: 健康检查返回不完整列表，不能恢复业务，重新进入 OPEN
+            circuit_breaker.record_success(is_complete=False)
             log(f"  [列表完整性警告] 活动列表不完整 ({getattr(items, 'error', '未知原因')})，"
                 f"仅拉取到 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，"
                 f"禁止基于不完整数据进行抢课决策，跳过本次轮询")
             time.sleep(poll)
             continue
+        else:
+            # 数据完整有效，恢复正常 (C06)
+            circuit_breaker.record_success(is_complete=True)
+            retry_policy.record_success()
+
+        # ---------------- UNKNOWN 安全屏障：未决状态优先只读复核 ----------------
+        unresolved_recs = state_store.get_unresolved_records()
+        if unresolved_recs:
+            target_unres = unresolved_recs[0]
+            unres_aid = target_unres["activity_id"]
+            unres_name = target_unres.get("activity_name") or unres_aid
+            log(f"  [安全屏障] 检测到存在未决活动 {unres_name} (id={unres_aid})，冻结候选队列，正在执行服务端只读复核…")
+            res_ok, res_status, res_msg, remote_item = reg_mgr.resolve_unknown(unres_aid, unres_name)
+            if res_status == RegistrationStatus.SUCCESS:
+                log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认报名成功！")
+                reporter.record_attempt(unres_aid, unres_name, "SUCCESS", "复核确认成功")
+                it_for_quota = remote_item or target_unres
+                if "startTime" in it_for_quota:
+                    try:
+                        act_w = week_of_item(it_for_quota)
+                        act_d = datetime.date.fromtimestamp(int(it_for_quota["startTime"]) / 1000)
+                        if is_special(it_for_quota, cfg):
+                            special_done += 1
+                        else:
+                            week_done[act_w] = week_done.get(act_w, 0) + 1
+                            DAY_DONE[act_d] = DAY_DONE.get(act_d, 0) + 1
+                        EXTRA.append((act_w, activity_slot(it_for_quota), "已抢:" + unres_name))
+                    except Exception:
+                        pass
+            elif res_status == RegistrationStatus.RETRYABLE:
+                log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认未报名，释放潜在名额占用。")
+                reporter.record_attempt(unres_aid, unres_name, "FAILED", "复核确认未报名")
+            else:
+                log(f"  [安全屏障保持] 未决活动 {unres_name} 暂无法确认真实状态，继续保持队列冻结。")
+                time.sleep(poll)
+                continue
+
+            # 再次检查是否仍有未决记录
+            if state_store.has_unresolved():
+                time.sleep(poll)
+                continue
 
         # 每个教学周已报的普通活动数（跨周互不干扰）
         reg_by_week = {}
@@ -847,8 +906,14 @@ def _cmd_grab_inner(cfg, st):
                 it, validate_rules_cb=validate_rules
             )
             log(f"  报名 {name} -> [{final_status}] {reason}")
+            reporter.record_attempt(aid, name, final_status, reason)
 
-            if ok:
+            if final_status == RegistrationStatus.UNKNOWN:
+                # 核心安全屏障 (U01, U02, U03): 结果未知立即冻结整个候选队列，严禁继续提交下一候选！
+                log(f"  [安全屏障触发] 活动 {name} 提交结果未知 (UNKNOWN)，安全屏障立即冻结后续候选队列！")
+                acted = True
+                break
+            elif ok:
                 d = datetime.date.fromtimestamp(int(it["startTime"]) / 1000)
                 if spec:
                     special_done += 1
@@ -870,30 +935,38 @@ def _cmd_grab_inner(cfg, st):
 
         time.sleep(poll)
 
-    # 抢课循环结束或满额时执行最终全局对账
+    # 抢课循环结束或满额时执行最终全局对账与报告输出
     reconciler = ReconciliationManager(c, cfg, tt, week_of)
     report = reconciler.reconcile()
-    if report.get("success"):
-        log("================ 最终报名结果全局核对 ================")
-        log(f"服务端实际已报名 {report['total_registered']} 节（普通 {report['normal_registered']} 节，特殊 {report['special_registered']} 节）：")
-        for it in report.get("items", []):
-            st_ms = int(it.get("startTime") or 0)
-            a = activity_slot(it)
-            log(f"  - {fmt_ms(st_ms)}  {slot_text(a) if a else '?'}  {it.get('name')}  (id={it.get('id')})")
-        if report.get("exceeded"):
-            log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-            log("  [严重超额告警] 服务端实际报名已超过上限！")
-            for w, cnt in report.get("exceeded_weeks", {}).items():
-                log(f"    第 {w} 周报名 {cnt} 节，超过限制 {max_normal} 节！")
-            for d_str, cnt in report.get("exceeded_days", {}).items():
-                log(f"    日期 {d_str} 报名 {cnt} 节，超过限制 {cfg.get('max_per_day', 1)} 节！")
-            log("  调用方已阻断任何后续提交。请运行 tools/cancel_one.py 人工确认退课。")
-            log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        else:
-            log("  核对通过：实际报名未超出配置上限。")
-        log("======================================================")
+    unresolved_cnt = len(state_store.get_unresolved_records())
+    cb_metrics = circuit_breaker.get_metrics()
 
-    log(f"观察窗口结束。本次抢到 {sum(week_done.values())} 节，额外 {special_done} 节")
+    reporter.current_week = cw
+    reporter.set_circuit_metrics(
+        outage_seconds=cb_metrics["total_outage_seconds"],
+        trip_count=cb_metrics["trip_count"]
+    )
+    reporter.set_reconciliation_result(
+        reconciled_items=report.get("items", []) if report.get("success") else [],
+        unresolved_count=unresolved_cnt,
+        normal_registered=report.get("normal_registered", sum(week_done.values())),
+        max_normal=max_normal,
+        special_registered=report.get("special_registered", special_done),
+        max_per_day=int(cfg.get("max_per_day", 1)),
+        weekly_exceeded=bool(report.get("exceeded_weeks")),
+        daily_exceeded=bool(report.get("exceeded_days"))
+    )
+
+    # 控制台多段式统一报告 (5.4, 5.6)
+    log("\n" + reporter.format_console_report())
+
+    # 自动保存 Markdown 报告 (5.5, R11, R12)
+    try:
+        rpt_dir = os.path.join(LOGS, "reports")
+        saved_rpt = reporter.save_markdown_report(report_dir=rpt_dir)
+        log(f"已自动生成抢课结果报告文件: {saved_rpt}")
+    except Exception as e:
+        log(f"自动生成 Markdown 报告异常: {e}")
 
 
 def cmd_refresh():

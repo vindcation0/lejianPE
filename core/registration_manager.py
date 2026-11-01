@@ -45,6 +45,10 @@ class RegistrationManager:
         aid = str(item.get("id"))
         name = (item.get("name") or "").replace("\n", " ").strip()
 
+        # ---------------- 0. UNKNOWN 安全屏障：全局单未决请求互斥 (U12) ----------------
+        if self.state_store.has_unresolved(exclude_activity_id=aid):
+            return False, RegistrationStatus.UNKNOWN, f"存在其他未决报名请求，安全屏障已冻结队列，禁止提交新候选: {name}", item
+
         # ---------------- 1. 本地状态检查与冲突前置拦截 ----------------
         rec = self.state_store.get_record(aid)
         if rec:
@@ -198,3 +202,33 @@ class RegistrationManager:
                 error_message=f"提交报 {res.reason}，且复核未能取得确认"
             )
             return False, RegistrationStatus.UNKNOWN, f"提交异常且无法复核状态({res.reason})，保持 UNKNOWN", item
+
+    def resolve_unknown(self, activity_id: str, activity_name: str = "") -> Tuple[bool, str, str, Optional[Dict]]:
+        """
+        对已处于 UNKNOWN / VERIFYING 的未决活动执行一次只读状态复核。
+        返回: (is_success: bool, final_status: str, reason: str, remote_item: Optional[Dict])
+        - 明确已报: (True, SUCCESS, ..., remote_item)
+        - 明确未报: (False, RETRYABLE, ..., remote_item)
+        - 无法确定: (False, UNKNOWN, ..., None)
+        """
+        aid = str(activity_id)
+        name = activity_name
+        if not name:
+            rec = self.state_store.get_record(aid)
+            name = rec.get("activity_name", "") if rec else ""
+
+        self.state_store.record_verifying(aid)
+        verified, is_reg, remote_item = self.req_mgr.verify_registration(aid)
+        if verified:
+            if is_reg:
+                self.state_store.record_success(aid, name, http_status=200)
+                self.audit_logger.log_event("resolve_unknown_success", {"aid": aid, "name": name})
+                return True, RegistrationStatus.SUCCESS, f"复核确认已成功: {name}", remote_item
+            else:
+                self.state_store.record_retryable(aid, "复核明确确认未报名")
+                self.audit_logger.log_event("resolve_unknown_not_registered", {"aid": aid, "name": name})
+                return False, RegistrationStatus.RETRYABLE, f"复核明确确认未报名: {name}", remote_item
+        else:
+            self.state_store.record_unknown(aid, name, "复核失败或列表不完整，保持 UNKNOWN")
+            self.audit_logger.log_event("resolve_unknown_failed", {"aid": aid, "name": name})
+            return False, RegistrationStatus.UNKNOWN, f"复核失败或列表不完整，保持 UNKNOWN: {name}", None

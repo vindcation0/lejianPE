@@ -111,6 +111,28 @@ class StateStore:
         except Exception as e:
             raise StateStoreError(f"查询未决记录失败: {e}") from e
 
+    def has_unresolved(self, exclude_activity_id: Optional[str] = None) -> bool:
+        """检查是否存在未决状态的记录（可排除指定活动自身）"""
+        try:
+            conn = self._get_conn()
+            if exclude_activity_id is not None:
+                cur = conn.execute(
+                    "SELECT 1 FROM registration_records WHERE status IN (?, ?, ?) AND activity_id != ? LIMIT 1",
+                    (RegistrationStatus.SUBMITTING, RegistrationStatus.UNKNOWN, RegistrationStatus.VERIFYING, str(exclude_activity_id))
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT 1 FROM registration_records WHERE status IN (?, ?, ?) LIMIT 1",
+                    (RegistrationStatus.SUBMITTING, RegistrationStatus.UNKNOWN, RegistrationStatus.VERIFYING)
+                )
+            return cur.fetchone() is not None
+        except Exception as e:
+            raise StateStoreError(f"检查未决记录失败: {e}") from e
+
+    def get_unresolved_activity_ids(self) -> List[str]:
+        """获取所有处于未决状态的 activity_id 列表"""
+        return [r["activity_id"] for r in self.get_unresolved_records()]
+
     def record_submitting(self, activity_id: str, activity_name: str) -> Dict:
         """
         进入提交阶段（事务内写入）。

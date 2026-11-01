@@ -117,7 +117,11 @@ class RequestManager:
         绝对不自动重复提交！
         根据响应将结果严格分类为 SUCCESS / FAILED / UNKNOWN / UNAUTHORIZED / RATE_LIMITED。
         """
-        code, data = self.client.call("POST", path, body=body, timeout=timeout)
+        try:
+            code, data = self.client.call("POST", path, body=body, timeout=timeout)
+        except Exception as e:
+            code = -1
+            data = str(e)
         raw_text = data.get("_raw", "") if isinstance(data, dict) else str(data)
 
         # 1. 网络超时或严重异常
