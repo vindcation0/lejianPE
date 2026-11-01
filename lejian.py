@@ -104,6 +104,32 @@ def _request(method, path, params=None, body=None, form=False, auth=True,
         return -1, repr(e)
 
 
+class ActivityList(list):
+    """
+    带有分页完整性元数据的活动列表。
+    继承自内置 list，保证 100% 向后兼容所有以列表方式消费 activity 的调用。
+    """
+    def __init__(self, items=None, complete=True, total=0, fetched=0, error=None):
+        super().__init__(items or [])
+        self.complete = bool(complete)
+        self.total = int(total)
+        self.fetched = int(fetched)
+        self.error = error
+
+    @property
+    def items(self):
+        return list(self)
+
+    def to_dict(self):
+        return {
+            "items": list(self),
+            "complete": self.complete,
+            "total": self.total,
+            "fetched": self.fetched,
+            "error": self.error,
+        }
+
+
 class Client:
     def __init__(self, state):
         self.s = state
@@ -190,34 +216,45 @@ class Client:
                 pass
 
     def activities(self, page_size=200, req_timeout=6):
-        """一次拉 200 条，避免分页多次往返"""
+        """一次拉 200 条，分页拉取全部活动并跟踪分页完整性"""
         out, page = [], 1
+        total = 0
+        complete = True
+        err_msg = None
+
         while page <= 10:
             code, obj = None, None
             for _ in range(3):
                 code, obj = self.call("POST", "education/app/activity/getActivityList",
                                       {"state": 1, "page": page, "size": page_size,
                                        "semesterId": self.s["semesterId"]},
-                                      timeout=req_timeout)
+                                       timeout=req_timeout)
                 if code == 200 and isinstance(obj, dict) and obj.get("code") == 0:
                     break
                 time.sleep(0.25)
-            if code != 200 or not isinstance(obj, dict):
+            if code != 200 or not isinstance(obj, dict) or obj.get("code") != 0:
                 self._note_fail(code)
+                complete = False
+                err_msg = f"第 {page} 页拉取失败 (HTTP {code})"
                 break
             self._note_ok()
             d = obj.get("data") or {}
             items = d.get("items") or []
+            total = int(d.get("total") or 0)
             for it in items:
                 for k in ("name", "address"):
                     if isinstance(it.get(k), str):
                         it[k] = re.sub(r"\s+", " ", it[k]).strip()
             out.extend(items)
-            total = d.get("total") or 0
             if len(out) >= total or not items:
                 break
             page += 1
-        return out
+
+        if total > 0 and len(out) < total and complete:
+            complete = False
+            err_msg = f"未拉取全量活动 (已获取 {len(out)}/{total})"
+
+        return ActivityList(out, complete=complete, total=total, fetched=len(out), error=err_msg)
 
     def check_conflict(self, activity_id):
         code, obj = self.call("GET", "education/app/activity/checkConflict",
@@ -482,6 +519,8 @@ def pick_targets(items, cfg, tt, cw):
         day_count[d] = day_count.get(d, 0) + 1
     for d, n in DAY_DONE.items():
         day_count[d] = day_count.get(d, 0) + n
+    # 候选筛选阶段的临时每日计数，防止同日多个普通活动同时入选
+    temp_day_count = dict(day_count)
 
     for it in items:
         name = it.get("name") or ""
@@ -504,14 +543,17 @@ def pick_targets(items, cfg, tt, cw):
         if include_special and is_special(it, cfg):
             picked.append((0, it, "特殊"))
             continue
+        d = None
         if max_per_day > 0:
             d = datetime.date.fromtimestamp(int(it["startTime"]) / 1000)
-            if day_count.get(d, 0) >= max_per_day:
+            if temp_day_count.get(d, 0) >= max_per_day:
                 continue
         for idx, t in enumerate(targets):
             if match_target(it, t):
                 label = t.get("keyword") or t.get("teacher") or t.get("time") or "?"
                 picked.append((idx + 1, it, f"志愿{idx+1}:{label}"))
+                if max_per_day > 0 and d is not None:
+                    temp_day_count[d] = temp_day_count.get(d, 0) + 1
                 break
 
     picked.sort(key=lambda x: (x[0], activity_slot(x[1])[1]))
@@ -546,6 +588,8 @@ def cmd_list():
         log(f"[Token 警告] 无法拉取活动列表 (Token 刷新失败: {e})，请先重新同步 Token。")
         return
     items = c.activities()
+    if not getattr(items, "complete", True):
+        log(f"  [警告] 当前活动列表获取不完整（仅获取 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，{getattr(items, 'error', '')}），仅显示部分结果。")
     tt = load_timetable()
     cw = current_week(tt)
     status_text, _, tw = get_semester_status(tt)
@@ -701,16 +745,26 @@ def _cmd_grab_inner(cfg, st):
             retry_policy.sleep_backoff()
             continue
 
+        if not getattr(items, "complete", True):
+            log(f"  [列表完整性警告] 活动列表不完整 ({getattr(items, 'error', '未知原因')})，"
+                f"仅拉取到 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，"
+                f"禁止基于不完整数据进行抢课决策，跳过本次轮询")
+            time.sleep(poll)
+            continue
+
         # 每个教学周已报的普通活动数（跨周互不干扰）
         reg_by_week = {}
+        reg_by_day = {}
         for i in items:
             if not i.get("isRegister") or is_special(i, cfg):
                 continue
             try:
                 w = week_of_item(i)
+                d_i = datetime.date.fromtimestamp(int(i["startTime"]) / 1000)
             except Exception:
                 continue
             reg_by_week[w] = reg_by_week.get(w, 0) + 1
+            reg_by_day[d_i] = reg_by_day.get(d_i, 0) + 1
 
         picked = pick_targets(items, cfg, tt, cw)
         now_ms = time.time() * 1000
@@ -742,6 +796,14 @@ def _cmd_grab_inner(cfg, st):
             if not spec and already >= max_normal:
                 cap_blocked += 1
                 continue
+
+            act_date = datetime.date.fromtimestamp(int(it["startTime"]) / 1000)
+            already_day = reg_by_day.get(act_date, 0) + DAY_DONE.get(act_date, 0)
+            max_per_day = int(cfg.get("max_per_day", 1))
+            if not spec and max_per_day > 0 and already_day >= max_per_day:
+                log(f"  [每日上限拦截] {name} 所在日期 {act_date} 已达每日上限 ({already_day}/{max_per_day} 节)，跳过提交")
+                continue
+
             if time.time() - last_try.get(aid, 0) < retry_cool:
                 continue
 
@@ -765,6 +827,14 @@ def _cmd_grab_inner(cfg, st):
                     return False, "名额已满"
                 if cfg.get("exclude_member", True) and is_member_only(act_item):
                     return False, "会员制活动"
+                if not spec:
+                    curr_d = datetime.date.fromtimestamp(int(act_item["startTime"]) / 1000)
+                    cur_d_tot = reg_by_day.get(curr_d, 0) + DAY_DONE.get(curr_d, 0)
+                    if max_per_day > 0 and cur_d_tot >= max_per_day:
+                        return False, f"当天普通活动已报满 {max_per_day} 节"
+                    cur_w_tot = reg_by_week.get(wk, 0) + week_done.get(wk, 0)
+                    if cur_w_tot >= max_normal:
+                        return False, f"当周普通活动已报满 {max_normal} 节"
                 if cfg.get("check_conflict", True):
                     try:
                         if c.check_conflict(act_item.get("id")):

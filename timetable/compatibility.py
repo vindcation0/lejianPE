@@ -26,7 +26,7 @@ def from_schema1_course(c: Dict[str, Any]) -> TimeSlot:
 
 
 def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
-    """将旧版完整课表数据转为新版 Timetable 对象"""
+    """将旧版完整课表数据转为新版 Timetable 对象并严格执行全量校验"""
     w1 = data.get("week1_monday")
     if not w1:
         # 若缺失则根据当前时间推算
@@ -34,6 +34,7 @@ def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
         today = datetime.date.today()
         monday = today - datetime.timedelta(days=today.weekday())
         w1 = (monday - datetime.timedelta(days=7 * (cw - 1))).isoformat()
+        print(f"[旧版课表兼容] 缺失 week1_monday，基于基准教学周第 {cw} 周及当前日期 {today} 自动推算第一教学周周一为 {w1}")
 
     slots: List[TimeSlot] = []
     raw_courses = data.get("courses")
@@ -51,6 +52,10 @@ def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
     total_w = int(data.get("total_weeks", 16))
     tt = Timetable(week1_monday=w1, busy_slots=slots, total_weeks=total_w, schema_version=2)
     tt.deduplicate()
+
+    # 执行新版全量业务规则校验，防止旧版数据绕过 week1_monday 星期一校验及周次区间校验
+    validate_timetable_dict(tt.to_dict())
+
     return tt
 
 

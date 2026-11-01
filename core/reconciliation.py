@@ -46,6 +46,14 @@ class ReconciliationManager:
                 "exceeded": False
             }
 
+        if not getattr(items, "complete", True):
+            return {
+                "success": False,
+                "error": f"对账列表不完整（仅获取 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，{getattr(items, 'error', '')}），对账中止",
+                "registered": [],
+                "exceeded": False
+            }
+
         registered_items = [it for it in items if it.get("isRegister")]
 
         by_week: Dict[int, List[Dict]] = {}

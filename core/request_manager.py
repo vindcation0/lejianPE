@@ -253,7 +253,11 @@ class RequestManager:
         for it in items:
             if str(it.get("id")) == str(activity_id):
                 is_reg = bool(it.get("isRegister"))
-                return True, is_reg, it
+                if is_reg:
+                    return True, True, it
+                if not getattr(items, "complete", True):
+                    return False, None, None
+                return True, False, it
 
         # 列表中未检索到该活动（数据不全或已下架），不能轻率断定为未报名
         return False, None, None
