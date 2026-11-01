@@ -3,8 +3,17 @@
 =======================================
 安全准则：
 - 允许本地回环通信 (127.0.0.1, localhost, ::1, 127.0.0.0/8, Unix Domain Socket)
-- 严禁任何外部网络访问 (外部域名解析、公网 IP 连接、外部 HTTP/HTTPS 请求、代理穿透等)
-- 在真实建立连接前立即拦截并抛出 RuntimeError
+- 严格剔除通配地址 (0.0.0.0, ::) 作为远程连接目标
+- 拦截全量 Python 网络入口：
+  - socket.socket.connect
+  - socket.socket.connect_ex
+  - socket.socket.sendto (UDP)
+  - socket.getaddrinfo (DNS)
+  - socket.gethostbyname (DNS)
+  - socket.gethostbyname_ex (DNS)
+  - socket.create_connection
+  - http.client.HTTPConnection.connect / request (代理隧道防御)
+- 在真实建立连接或发出 DNS 查询前立即拦截并抛出 RuntimeError
 """
 import http.client
 import ipaddress
@@ -14,7 +23,11 @@ import urllib.parse
 from typing import Any, Optional, Tuple
 
 _orig_socket_connect = socket.socket.connect
+_orig_socket_connect_ex = socket.socket.connect_ex
+_orig_socket_sendto = socket.socket.sendto
 _orig_getaddrinfo = socket.getaddrinfo
+_orig_gethostbyname = socket.gethostbyname
+_orig_gethostbyname_ex = socket.gethostbyname_ex
 _orig_create_connection = socket.create_connection
 _orig_http_connect = http.client.HTTPConnection.connect
 _orig_http_request = http.client.HTTPConnection.request
@@ -23,14 +36,14 @@ _guard_installed = False
 
 
 def is_local_host(host: Optional[str]) -> bool:
-    """判断目标主机是否属于本地允许范围"""
+    """判断目标主机是否属于允许的本地回环范围 (严格排除 0.0.0.0 和 :: 通配地址)"""
     if not host:
-        return True
+        return False
     h = str(host).strip().lower()
-    if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::"):
+    if h in ("localhost", "127.0.0.1", "::1"):
         return True
 
-    # 检查是否为 127.0.0.0/8 范围内的 IPv4
+    # 检查是否为 loopback IP (如 127.0.0.0/8 范围内或 IPv6 回环)
     try:
         ip = ipaddress.ip_address(h)
         return ip.is_loopback
@@ -55,6 +68,45 @@ def guarded_connect(self, address: Any) -> Any:
     return _orig_socket_connect(self, address)
 
 
+def guarded_connect_ex(self, address: Any) -> int:
+    """拦截 socket.socket.connect_ex，在真正连接前阻断外部目标"""
+    if isinstance(address, tuple) and len(address) >= 2:
+        host = address[0]
+        if not is_local_host(host):
+            raise RuntimeError(
+                f"测试隔离屏障触发：单元测试严禁连接外部网络 (connect_ex)！目标: {address}"
+            )
+    elif isinstance(address, (str, bytes)):
+        # Unix Domain Socket
+        pass
+
+    return _orig_socket_connect_ex(self, address)
+
+
+def guarded_sendto(self, *args, **kwargs) -> int:
+    """拦截 socket.socket.sendto，防止向外部 IP 发送 UDP 数据"""
+    address = None
+    if len(args) == 2:
+        address = args[1]
+    elif len(args) >= 3:
+        address = args[2]
+    elif "address" in kwargs:
+        address = kwargs["address"]
+
+    if address:
+        if isinstance(address, tuple) and len(address) >= 2:
+            host = address[0]
+            if not is_local_host(host):
+                raise RuntimeError(
+                    f"测试隔离屏障触发：单元测试严禁向外部地址发送 UDP 数据！目标: {address}"
+                )
+        elif isinstance(address, (str, bytes)):
+            # Unix Domain Socket
+            pass
+
+    return _orig_socket_sendto(self, *args, **kwargs)
+
+
 def guarded_getaddrinfo(
     host: Optional[str],
     port: Any,
@@ -70,6 +122,24 @@ def guarded_getaddrinfo(
         )
 
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+def guarded_gethostbyname(hostname: str) -> str:
+    """拦截 socket.gethostbyname"""
+    if not is_local_host(hostname):
+        raise RuntimeError(
+            f"测试隔离屏障触发：单元测试严禁解析外部域名 (gethostbyname)！目标: {hostname}"
+        )
+    return _orig_gethostbyname(hostname)
+
+
+def guarded_gethostbyname_ex(hostname: str) -> Tuple[str, list, list]:
+    """拦截 socket.gethostbyname_ex"""
+    if not is_local_host(hostname):
+        raise RuntimeError(
+            f"测试隔离屏障触发：单元测试严禁解析外部域名 (gethostbyname_ex)！目标: {hostname}"
+        )
+    return _orig_gethostbyname_ex(hostname)
 
 
 def guarded_create_connection(
@@ -123,7 +193,11 @@ def install_network_guard():
     os.environ["no_proxy"] = "*"
 
     socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+    socket.socket.sendto = guarded_sendto
     socket.getaddrinfo = guarded_getaddrinfo
+    socket.gethostbyname = guarded_gethostbyname
+    socket.gethostbyname_ex = guarded_gethostbyname_ex
     socket.create_connection = guarded_create_connection
     http.client.HTTPConnection.connect = guarded_http_connect
     http.client.HTTPConnection.request = guarded_http_request
@@ -137,7 +211,11 @@ def uninstall_network_guard():
         return
 
     socket.socket.connect = _orig_socket_connect
+    socket.socket.connect_ex = _orig_socket_connect_ex
+    socket.socket.sendto = _orig_socket_sendto
     socket.getaddrinfo = _orig_getaddrinfo
+    socket.gethostbyname = _orig_gethostbyname
+    socket.gethostbyname_ex = _orig_gethostbyname_ex
     socket.create_connection = _orig_create_connection
     http.client.HTTPConnection.connect = _orig_http_connect
     http.client.HTTPConnection.request = _orig_http_request

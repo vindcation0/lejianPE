@@ -1,11 +1,9 @@
-# Gitleaks 忽略指纹清单
-# 1. 乐健 App 逆向动态 AES 密钥派生协议公开常量 (非用户私密凭据)
+# Gitleaks 精确忽略指纹清单
+# 仅针对历史提交中已公开的逆向协议常量与单测虚拟占位符，严禁添加宽泛文件忽略规则。
+
+# 1. 乐健 App 逆向动态 AES 密钥派生协议公开常量 (历史提交公开常量，非私密凭据)
 fe3f6d25e75a23146b20254783e0144ee0f2a9d9:docs/乐健体育账号密码登录协议分析与阶段工作总结.md:generic-api-key:40
 ce2aaa6fb93a760fccb6084f0a09594eb59993c8:tools/login_envelope.py:generic-api-key:16
 
-# 2. 单测脱敏测试虚拟占位字符串
+# 2. 单测脱敏测试虚拟占位字符串 (历史提交单测数据)
 a1cbceb7163efafcccdb239eb1e3051f4364e88f:tests/test_auth.py:generic-api-key:650
-
-# 3. 本地运行时临时生成文件（已纳入 .gitignore）
-state.json:generic-api-key:2
-state.json:generic-api-key:3
