@@ -18,6 +18,7 @@ ACTIONS = [
     ("8", "强制刷新 token", ["lejian.py", "refresh"]),
     ("9", "账号密码登录（命令行·主要方式）", ["lejian.py", "login"]),
     ("b", "重新初始化认证（一键修复凭据与会话）", ["lejian.py", "reinit"]),
+    ("s", "系统配置向导（环境自检与首次初始化）", ["lejian.py", "setup"]),
     ("a", "从模拟器 App 同步 Token（备用方案）", ["tools/resync_from_app.py"]),
 ]
 
@@ -27,6 +28,8 @@ def draw():
     print("=" * 50)
     print("        乐健体育 · 课外活动抢课工具")
     print("=" * 50)
+    if not os.path.exists(os.path.join(ROOT, "credential.json")):
+        print("   💡 首次使用提示：当前未检测到凭据，建议先选 [s] 运行配置向导")
     print()
     for key, label, _ in ACTIONS:
         print(f"   [{key}]  {label}")

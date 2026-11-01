@@ -1053,6 +1053,15 @@ def cmd_reinit():
     AuthInitializer().reinitialize()
 
 
+def cmd_setup():
+    """运行系统配置向导（环境自检与首次初始化，支持 7 种系统状态自适应引导）"""
+    from core.config_wizard import ConfigWizard
+    wizard = ConfigWizard()
+    ok = wizard.run_wizard(interactive=True)
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_refresh():
     """强制刷新 token（不等过期）"""
     st = load_json(STATE)
@@ -1172,7 +1181,8 @@ def main():
     {"status": cmd_status, "list": cmd_list, "grab": cmd_grab,
      "timetable": cmd_timetable, "names": cmd_names,
      "refresh": cmd_refresh, "editor": cmd_editor,
-     "login": cmd_login, "reinit": cmd_reinit}.get(cmd, cmd_status)()
+     "login": cmd_login, "reinit": cmd_reinit,
+     "setup": cmd_setup, "wizard": cmd_setup}.get(cmd, cmd_status)()
 
 
 if __name__ == "__main__":
