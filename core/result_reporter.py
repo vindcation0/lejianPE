@@ -83,10 +83,23 @@ class ResultReporter:
         """记录最终服务端对账结果"""
         self.reconciliation_performed = True
         self.reconciled_items = list(reconciled_items)
-        self.reconciled_success = len(reconciled_items)
+
+        # 区分本轮尝试确认成功与既有/历史已报
+        attempted_ids = {str(r.get("activity_id")) for r in self.attempt_records if r.get("activity_id")}
+        if attempted_ids:
+            this_run_confirmed = [it for it in reconciled_items if str(it.get("id")) in attempted_ids]
+            self.this_run_success = len(this_run_confirmed)
+            self.historical_count = len(reconciled_items) - self.this_run_success
+            self.reconciled_success = self.this_run_success
+        else:
+            self.this_run_success = len(reconciled_items)
+            self.historical_count = 0
+            self.reconciled_success = len(reconciled_items)
+
+        self.total_server_registered = len(reconciled_items)
         self.unresolved_count = unresolved_count
 
-        # 确认未成功数量 = 总提交尝试 - 最终确认成功 - 仍未解决
+        # 确认未成功数量 = 总提交尝试 - 本轮确认成功 - 仍未解决
         self.reconciled_failed = max(0, self.attempts_total - self.reconciled_success - self.unresolved_count)
 
         self.normal_registered = normal_registered
@@ -117,7 +130,9 @@ class ResultReporter:
                 "performed": self.reconciliation_performed,
                 "confirmed_success": self.reconciled_success,
                 "confirmed_failed": self.reconciled_failed,
-                "unresolved": self.unresolved_count
+                "unresolved": self.unresolved_count,
+                "historical_count": getattr(self, "historical_count", 0),
+                "total_server_registered": getattr(self, "total_server_registered", len(self.reconciled_items)),
             },
             "quota": {
                 "normal": f"{self.normal_registered} / {self.max_normal}",
@@ -160,6 +175,8 @@ class ResultReporter:
         lines.append(f"确认报名成功：{self.reconciled_success} 节")
         lines.append(f"确认未报名  ：{self.reconciled_failed} 节")
         lines.append(f"尚未解决    ：{self.unresolved_count} 节")
+        if getattr(self, "historical_count", 0) > 0:
+            lines.append(f"既有已报活动：{self.historical_count} 节（总计已报：{self.total_server_registered} 节）")
         lines.append("")
 
         lines.append("四、实际报名情况")
@@ -251,6 +268,8 @@ class ResultReporter:
 
         lines.append("## 三、服务端最终对账")
         lines.append(f"- **服务端确认报名成功**：{self.reconciled_success} 节")
+        if getattr(self, "historical_count", 0) > 0:
+            lines.append(f"- **既有/历史已报活动**：{self.historical_count} 节（总计已报：{self.total_server_registered} 节）")
         lines.append(f"- **确认未报名**：{self.reconciled_failed} 节")
         lines.append(f"- **尚未解决 (UNRESOLVED)**：{self.unresolved_count} 节")
         lines.append("")

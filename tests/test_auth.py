@@ -862,6 +862,111 @@ class AuthTestSuite(unittest.TestCase):
             self.assertNotIn(secret_token, err)
             self.assertIn("ultr...6789", err)
 
+    # ==================== L01: 登录失败不破坏原有 state.json ====================
+    def test_L01_wrong_password_does_not_modify_state_file(self):
+        """L01: 错误密码或认证失败时，原有的有效 state.json 保持完好，绝不被篡改或覆盖"""
+        original_state = {
+            "accessToken": "old_token_valid_12345",
+            "refreshToken": "old_refresh_valid_67890",
+            "accessTokenExpires": int(time.time() * 1000) + 7200000,
+            "userId": "user_old_111",
+            "schoolId": "sch_001",
+            "semesterId": "sem_001",
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(original_state, f)
+
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "post_json", return_value=(200, json.dumps({"code": 10002, "message": "密码错误"}))):
+            with self.assertRaises(BusinessAuthError):
+                auth_mgr.login("13800138000", "wrong_pwd", "signdigital_abc")
+
+        # 验证 state.json 内容未发生任何改变
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            current_state = json.load(f)
+        self.assertEqual(current_state, original_state)
+
+    # ==================== L02: 签名失效精细化诊断 ====================
+    def test_L02_signature_invalid_50004_diagnosis(self):
+        """L02: 签名材料失效 (50004) 或含签名关键词时，准确识别并输出指引"""
+        auth_mgr = AuthManager(ssl_verify=False)
+        mock_body = json.dumps({"code": 50004, "message": "签名校验失败"})
+        with patch.object(auth_mgr, "post_json", return_value=(200, mock_body)):
+            with self.assertRaises(BusinessAuthError) as ctx:
+                auth_mgr.login("13800138000", "pwd123", "expired_sign")
+            self.assertEqual(ctx.exception.code, 50004)
+            self.assertIn("签名材料失效", str(ctx.exception))
+
+    # ==================== L03: 登录响应必要字段缺失分类 ====================
+    def test_L03_login_response_missing_required_fields(self):
+        """L03: 登录响应缺少必要字段时准确归类为 TokenAcquisitionError 或 SchoolInfoError"""
+        auth_mgr = AuthManager(ssl_verify=False)
+
+        # 缺少 accessToken
+        with patch.object(auth_mgr, "post_json", return_value=(200, json.dumps({
+            "code": 0, "message": "OK", "data": {"refreshToken": "ref", "schoolId": "sch"}
+        }))):
+            with self.assertRaises(TokenAcquisitionError):
+                auth_mgr.login("13800138000", "pwd123", "sign123")
+
+        # 缺少 schoolId
+        with patch.object(auth_mgr, "post_json", return_value=(200, json.dumps({
+            "code": 0, "message": "OK", "data": {"accessToken": "tok", "refreshToken": "ref"}
+        }))):
+            with self.assertRaises(SchoolInfoError):
+                auth_mgr.login("13800138000", "pwd123", "sign123")
+
+    # ==================== L04: 凭据文件损坏明确提示 ====================
+    def test_L04_credential_file_corrupted(self):
+        """L04: credential.json 损坏或不是合法 JSON 时，明确抛出 CredentialError"""
+        with open(self.cred_path, "w", encoding="utf-8") as f:
+            f.write("{corrupted_json_content...")
+
+        storage = CredentialStorage(self.cred_path)
+        with self.assertRaises(CredentialError) as ctx:
+            storage.load_credential()
+        self.assertIn("损坏", str(ctx.exception))
+
+    # ==================== L05: DPAPI 解密失败保护 ====================
+    def test_L05_dpapi_decrypt_failure_protects_credentials(self):
+        """L05: DPAPI 密文损坏或解密失败时抛出 CredentialError，拒绝采用残缺凭据"""
+        corrupted_cred = {
+            "account": "13800138000",
+            "isEncrypted": True,
+            "signDigitalEncrypted": "INVALID_BASE64_OR_CORRUPTED_CIPHERTEXT==",
+        }
+        with open(self.cred_path, "w", encoding="utf-8") as f:
+            json.dump(corrupted_cred, f)
+
+        storage = CredentialStorage(self.cred_path)
+        with self.assertRaises(CredentialError) as ctx:
+            storage.load_credential()
+        self.assertIn("解密失败", str(ctx.exception))
+
+    # ==================== L06: 抓包异常退出清理资源 ====================
+    def test_L06_capture_login_cleanup_resources(self):
+        """L06: 抓包异常中断或正常退出时，均可靠恢复代理、清理 reverse 映射并结束进程"""
+        from tools.capture_login import cleanup_resources
+
+        mock_dev = MagicMock()
+        mock_dev.serial = "emulator-5554"
+        mock_mitm = MagicMock()
+
+        cleanup_resources(mock_dev, mock_mitm)
+
+        mock_mitm.terminate.assert_called_once()
+        mock_dev.shell.assert_called_with("settings put global http_proxy :0")
+        mock_dev.run.assert_called_with("reverse", "--remove-all")
+
+        # 验证即使个别调用抛出异常，其余清理步骤也不崩溃
+        mock_dev_err = MagicMock()
+        mock_dev_err.serial = "emulator-5554"
+        mock_dev_err.shell.side_effect = RuntimeError("ADB error")
+        mock_mitm_err = MagicMock()
+        mock_mitm_err.terminate.side_effect = OSError("Process already dead")
+
+        cleanup_resources(mock_dev_err, mock_mitm_err)  # 不应抛出异常
+
 
 if __name__ == "__main__":
     unittest.main()

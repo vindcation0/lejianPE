@@ -15,7 +15,18 @@
   - 体质健康测试类不占名额（special）
 依赖：仅标准库。
 """
-import json, os, re, ssl, sys, time, datetime, urllib.request, urllib.error, urllib.parse
+import datetime
+import json
+import os
+import re
+import shutil
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -60,11 +71,20 @@ def load_json(path, default=None):
         return json.load(f)
 
 
-def save_json(path, obj):
+def save_json(path, obj, backup=True):
+    path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if backup and os.path.exists(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+    # 写入后完整性回读校验
+    with open(tmp, "r", encoding="utf-8") as f:
+        json.load(f)
     os.replace(tmp, path)
 
 
@@ -149,6 +169,7 @@ class ActivityList(list):
 class Client:
     def __init__(self, state):
         self.s = state
+        self._refresh_lock = threading.RLock()
 
     def expires_in(self):
         try:
@@ -157,26 +178,55 @@ class Client:
             return -1
 
     def refresh(self):
-        rt = self.s.get("refreshToken")
-        if not rt:
-            raise RuntimeError("state.json 缺 refreshToken，请在 App 里重新登录后跑 tools/make_state.py")
-        code, text = _request("GET", "authorization/user/refreshToken",
-                              params={"refreshToken": rt}, auth=False)
-        obj = json.loads(text)
-        if code != 200 or obj.get("code") != 0 or not obj.get("data"):
-            raise RuntimeError(f"刷新失败 HTTP {code}: {text[:200]}")
-        d = obj["data"]
-        self.s["accessToken"] = d["accessToken"]
-        self.s["refreshToken"] = d.get("refreshToken") or rt
-        self.s["accessTokenExpires"] = d.get("accessTokenExpires")
-        save_json(STATE, self.s)
-        log("token 已刷新至 " +
-            datetime.datetime.fromtimestamp(self.s["accessTokenExpires"] / 1000).strftime("%m-%d %H:%M"))
-        return self.s["accessToken"]
+        with self._refresh_lock:
+            rt = self.s.get("refreshToken")
+            if not rt:
+                raise RuntimeError("state.json 缺 refreshToken，请在 App 里重新登录后跑 tools/make_state.py")
+            code, text = _request("GET", "authorization/user/refreshToken",
+                                  params={"refreshToken": rt}, auth=False)
+            try:
+                obj = json.loads(text)
+            except Exception as e:
+                raise RuntimeError(f"刷新失败 HTTP {code}: 响应不是合法 JSON: {text[:200]}") from e
+
+            if code != 200 or not isinstance(obj, dict) or obj.get("code") != 0 or not obj.get("data"):
+                raise RuntimeError(f"刷新失败 HTTP {code}: {text[:200]}")
+
+            d = obj["data"]
+            if not isinstance(d, dict):
+                raise RuntimeError(f"刷新返回的数据结构非法: {type(d)}")
+
+            new_token = d.get("accessToken")
+            if not new_token or not str(new_token).strip():
+                raise RuntimeError("Token 刷新成功但响应中缺失 accessToken")
+
+            new_rt = d.get("refreshToken") or rt
+            try:
+                new_exp = int(d.get("accessTokenExpires") or 0)
+            except Exception:
+                new_exp = 0
+
+            if new_exp <= 0:
+                raise RuntimeError("Token 刷新响应中缺失有效的 accessTokenExpires")
+
+            # 构造新的状态副本，持久化成功后再更新内存中的 self.s，避免失败时状态不一致
+            new_s = dict(self.s)
+            new_s["accessToken"] = str(new_token).strip()
+            new_s["refreshToken"] = str(new_rt).strip()
+            new_s["accessTokenExpires"] = new_exp
+
+            save_json(STATE, new_s, backup=True)
+            self.s.update(new_s)
+
+            log("token 已刷新至 " +
+                datetime.datetime.fromtimestamp(new_exp / 1000).strftime("%m-%d %H:%M"))
+            return self.s["accessToken"]
 
     def ensure_token(self, margin=1200):
         if self.expires_in() < margin:
-            self.refresh()
+            with self._refresh_lock:
+                if self.expires_in() < margin:
+                    self.refresh()
         return self.s["accessToken"]
 
     def post(self, path, body, timeout=15):
@@ -323,11 +373,16 @@ def activity_slot(it):
     try:
         st = int(it.get("startTime"))
         en = int(it.get("endTime"))
+        if st <= 0 or en <= st:
+            return None
     except Exception:
         return None
-    a = datetime.datetime.fromtimestamp(st / 1000)
-    b = datetime.datetime.fromtimestamp(en / 1000)
-    return (a.isoweekday(), a.hour * 60 + a.minute, b.hour * 60 + b.minute)
+    try:
+        a = datetime.datetime.fromtimestamp(st / 1000)
+        b = datetime.datetime.fromtimestamp(en / 1000)
+        return (a.isoweekday(), a.hour * 60 + a.minute, b.hour * 60 + b.minute)
+    except Exception:
+        return None
 
 
 def fmt_ms(v, f="%m-%d %H:%M"):
@@ -910,10 +965,13 @@ def _cmd_grab_inner(cfg, st):
                         return False, f"当周普通活动已报满 {max_normal} 节"
                 if cfg.get("check_conflict", True):
                     try:
-                        if c.check_conflict(act_item.get("id")):
+                        conf = c.check_conflict(act_item.get("id"))
+                        if conf is True:
                             return False, "服务端判定冲突"
-                    except Exception:
-                        pass
+                        elif conf is None:
+                            return False, "服务端冲突检查接口异常（结果未知，安全阻断）"
+                    except Exception as e:
+                        return False, f"服务端冲突检查调用异常: {e}"
                 return True, "OK"
 
             ok, final_status, reason, final_item = reg_mgr.register_activity(

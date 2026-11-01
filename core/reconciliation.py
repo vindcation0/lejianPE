@@ -5,6 +5,8 @@
 1. 统计实际 isRegister 活动总数与各周分布。
 2. 校验是否超过配置的 max_normal 与 max_per_day。
 3. 若发现超额，发出显著告警并立刻阻断任何后续提交，提示用户人工退课，避免误退或自动退课副作用。
+4. 区分合法完整空列表与异常空列表，避免误判对账失败。
+5. 记录无法解析时间戳的异常活动，避免静默丢失潜在配额占用。
 """
 import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -38,15 +40,34 @@ class ReconciliationManager:
                 "exceeded": False
             }
 
+        # 检查是否完整
+        is_complete = bool(getattr(items, "complete", True))
+        total_cnt = getattr(items, "total", len(items) if items is not None else 0)
+
         if not items:
+            # 区分合法完整的空列表与非正常空数据
+            if is_complete and total_cnt == 0:
+                return {
+                    "success": True,
+                    "total_registered": 0,
+                    "normal_registered": 0,
+                    "special_registered": 0,
+                    "by_week": {},
+                    "by_day": {},
+                    "exceeded": False,
+                    "exceeded_weeks": {},
+                    "exceeded_days": {},
+                    "items": [],
+                    "unparsed_items": []
+                }
             return {
                 "success": False,
-                "error": "活动列表为空",
+                "error": f"活动列表为空或未通过完整性验证 (complete={is_complete}, total={total_cnt})",
                 "registered": [],
                 "exceeded": False
             }
 
-        if not getattr(items, "complete", True):
+        if not is_complete:
             return {
                 "success": False,
                 "error": f"对账列表不完整（仅获取 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，{getattr(items, 'error', '')}），对账中止",
@@ -60,16 +81,26 @@ class ReconciliationManager:
         by_day: Dict[datetime.date, List[Dict]] = {}
         special_items: List[Dict] = []
         normal_items: List[Dict] = []
+        unparsed_items: List[Dict] = []
 
         for it in registered_items:
             name = (it.get("name") or "").replace("\n", " ").strip()
             is_spec = any(k in name for k in special_keywords)
             try:
                 st = int(it.get("startTime") or 0)
+                if st <= 0:
+                    raise ValueError(f"startTime 无效: {st}")
                 dt = datetime.datetime.fromtimestamp(st / 1000)
                 d = dt.date()
                 wk = self.week_calc_fn(d, self.timetable)
-            except Exception:
+            except Exception as e:
+                unparsed_items.append({
+                    "id": it.get("id"),
+                    "name": name,
+                    "reason": str(e)
+                })
+                if is_spec:
+                    special_items.append(it)
                 continue
 
             if is_spec:
@@ -89,6 +120,8 @@ class ReconciliationManager:
             "total_registered": len(registered_items),
             "normal_registered": len(normal_items),
             "special_registered": len(special_items),
+            "unparsed_items": unparsed_items,
+            "unparsed_count": len(unparsed_items),
             "by_week": {w: [it.get("name") for it in acts] for w, acts in by_week.items()},
             "by_day": {str(d): [it.get("name") for it in acts] for d, acts in by_day.items()},
             "exceeded": has_exceeded,

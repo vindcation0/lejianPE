@@ -14,6 +14,7 @@
 用法：
     python tools\\capture_login.py
 """
+import argparse
 import json
 import os
 import re
@@ -58,6 +59,32 @@ def banner(msg):
     print("=" * 60, flush=True)
 
 
+def cleanup_resources(dev, mitm=None):
+    """
+    可靠资源清理函数：
+    1. 终止 mitmproxy 子进程；
+    2. 恢复模拟器全局 HTTP 代理为 :0；
+    3. 清除 adb reverse 端口映射。
+    无论正常退出、超时还是中途异常中断均安全执行。
+    """
+    if mitm is not None:
+        try:
+            mitm.terminate()
+            try:
+                mitm.wait(timeout=3)
+            except Exception:
+                mitm.kill()
+        except Exception:
+            pass
+
+    if dev is not None and getattr(dev, "serial", None):
+        try:
+            dev.shell("settings put global http_proxy :0")
+            dev.run("reverse", "--remove-all")
+        except Exception:
+            pass
+
+
 class Device:
     def __init__(self, adb):
         self.adb = adb
@@ -95,6 +122,11 @@ class Device:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="一键重抓登录签名材料")
+    parser.add_argument("-y", "--yes", action="store_true", help="跳过清空 App 数据的用户确认提示")
+    parser.add_argument("--timeout", type=int, default=600, help="等待抓包超时时间（秒，默认 600）")
+    args = parser.parse_args()
+
     adb = find_adb()
     if not adb:
         sys.exit("找不到 adb，请确认模拟器已安装")
@@ -135,74 +167,83 @@ def main():
     mounts = dev.shell("mount | grep -c cacerts").stdout.strip()
     print(f"  生效挂载数: {mounts}")
 
-    banner("步骤 4/6  启动抓包")
-    os.makedirs(CAPTURES, exist_ok=True)
-    if os.path.exists(FLOWS):
-        os.remove(FLOWS)
-    mitm = subprocess.Popen(
-        ["mitmdump", "--listen-port", "8081", "-s", ADDON,
-         "--set", "console_eventlog_verbosity=warn"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(4)
-    print("  抓包进程 PID:", mitm.pid)
-    dev.run("reverse", "tcp:8081", "tcp:8081")
-    dev.shell("settings put global http_proxy 127.0.0.1:8081")
-    print("  代理:", dev.shell("settings get global http_proxy").stdout.strip())
-
-    banner("步骤 5/6  清空 App 数据，回到登录页")
-    dev.shell(f"am force-stop {PKG}")
-    print("  清空中…")
-    dev.shell(f"pm clear {PKG}")
-    time.sleep(2)
-    dev.shell(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1")
-    print("  已启动 App，请等待登录页出现")
-
-    banner("请你操作：在模拟器里登录")
-    print("  1. 勾选《用户服务协议》与《隐私政策》")
-    print("  2. 输入新密码")
-    print("  3. 点击登录")
-    print()
-    print("  正在等待登录请求…（最多 10 分钟）")
-
-    deadline = time.time() + 600
-    got = False
-    while time.time() < deadline:
-        time.sleep(2)
-        if not os.path.exists(FLOWS):
-            continue
-        try:
-            for line in open(FLOWS, encoding="utf-8"):
-                if LOGIN_PATH in line:
-                    rec = json.loads(line)
-                    if rec.get("status") == 200:
-                        got = True
-                        break
-        except Exception:
-            continue
-        if got:
-            break
-        if int(time.time()) % 30 < 3:
-            print(f"    等待中… 已抓 {sum(1 for _ in open(FLOWS, encoding='utf-8'))} 条", flush=True)
-
-    mitm.terminate()
+    mitm = None
     try:
-        dev.shell("settings put global http_proxy :0")
-        dev.run("reverse", "--remove-all")
-    except Exception:
-        pass
+        banner("步骤 4/6  启动抓包")
+        os.makedirs(CAPTURES, exist_ok=True)
+        if os.path.exists(FLOWS):
+            os.remove(FLOWS)
+        mitm = subprocess.Popen(
+            ["mitmdump", "--listen-port", "8081", "-s", ADDON,
+             "--set", "console_eventlog_verbosity=warn"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(4)
+        print("  抓包进程 PID:", mitm.pid)
+        dev.run("reverse", "tcp:8081", "tcp:8081")
+        dev.shell("settings put global http_proxy 127.0.0.1:8081")
+        print("  代理:", dev.shell("settings get global http_proxy").stdout.strip())
 
-    if not got:
-        sys.exit("\n没抓到登录请求，未修改 credential.json。")
+        banner("步骤 5/6  清空 App 数据，回到登录页")
+        print("  提示：清理应用数据将退出当前已登录账号并重置本地缓存，以便回到初始密码登录页。")
+        if not args.yes:
+            try:
+                ans = input("  确认清空乐健 App 本地数据？[Y/n]: ").strip().lower()
+                if ans and ans not in ("y", "yes"):
+                    print("  已取消清空操作。抓包流程中止。")
+                    return
+            except (KeyboardInterrupt, EOFError):
+                print("\n  操作已取消。")
+                return
 
-    banner("步骤 6/6  提取签名")
-    r = sh([sys.executable, os.path.join(ROOT, "tools", "login_cli.py"),
-            "--setup", FLOWS])
-    print(r.stdout)
-    if r.returncode != 0:
-        print(r.stderr)
-        sys.exit("提取失败")
+        dev.shell(f"am force-stop {PKG}")
+        print("  清空中…")
+        dev.shell(f"pm clear {PKG}")
+        time.sleep(2)
+        dev.shell(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1")
+        print("  已启动 App，请等待登录页出现")
 
-    print("完成。现在可以用菜单 [9] 或 python tools\\login_cli.py 登录了。")
+        banner("请你操作：在模拟器里登录")
+        print("  1. 勾选《用户服务协议》与《隐私政策》")
+        print("  2. 输入新密码")
+        print("  3. 点击登录")
+        print()
+        print(f"  正在等待登录请求…（最多等待 {args.timeout} 秒）")
+
+        deadline = time.time() + args.timeout
+        got = False
+        while time.time() < deadline:
+            time.sleep(2)
+            if not os.path.exists(FLOWS):
+                continue
+            try:
+                for line in open(FLOWS, encoding="utf-8"):
+                    if LOGIN_PATH in line:
+                        rec = json.loads(line)
+                        if rec.get("status") == 200:
+                            got = True
+                            break
+            except Exception:
+                continue
+            if got:
+                break
+            if int(time.time()) % 30 < 3:
+                print(f"    等待中… 已抓 {sum(1 for _ in open(FLOWS, encoding='utf-8'))} 条", flush=True)
+
+        if not got:
+            print("\n❌ 没抓到登录请求，未修改 credential.json。")
+            return
+
+        banner("步骤 6/6  提取签名")
+        r = sh([sys.executable, os.path.join(ROOT, "tools", "login_cli.py"),
+                "--setup", FLOWS])
+        print(r.stdout)
+        if r.returncode != 0:
+            print(r.stderr)
+            sys.exit("提取失败")
+
+        print("完成。现在可以用菜单 [9] 或 python tools\\login_cli.py 登录了。")
+    finally:
+        cleanup_resources(dev, mitm)
 
 
 if __name__ == "__main__":

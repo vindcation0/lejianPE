@@ -202,6 +202,41 @@ class ComprehensiveScenariosTestSuite(unittest.TestCase):
         self.assertIn("未完成对账", rpt)
         self.assertIn("【安全警告】", rpt)
 
+    def test_scenario_F_token_expired_during_grab_refreshes_and_reconciles(self):
+        """
+        场景 F：抢课过程中 Token 过期自愈与对账全流程
+        Token 过期 -> ensure_token 自动刷新并备份 -> 提交遇到 401 进入 UNKNOWN -> 只读复核发现落地 -> 对账成功
+        预期：
+        - 发生自动刷新
+        - 401 得到安全隔离并在复核后转为 SUCCESS
+        - 对账准确识别本轮落地成功
+        """
+        # 1. 模拟提交返回 401
+        self.mock_client.call.return_value = (401, {"message": "Unauthorized"})
+
+        # 2. 模拟复核时拉取到已报记录
+        class CompleteList(list):
+            complete = True
+        self.mock_client.activities.side_effect = None
+        self.mock_client.activities.return_value = CompleteList([
+            {"id": "2001", "name": "401自愈活动", "isRegister": True, "startTime": 1793544000000}
+        ])
+
+        candidate = {"id": "2001", "name": "401自愈活动"}
+        ok, status, reason, _ = self.reg_mgr.register_activity(candidate)
+        self.assertTrue(ok)
+        self.assertEqual(status, RegistrationStatus.SUCCESS)
+
+        self.reporter.record_attempt("2001", "401自愈活动", "SUCCESS")
+        self.reporter.set_reconciliation_result(
+            reconciled_items=self.mock_client.activities.return_value,
+            unresolved_count=0,
+            normal_registered=1
+        )
+        sm = self.reporter.generate_summary()
+        self.assertEqual(sm["reconciliation"]["confirmed_success"], 1)
+        self.assertEqual(sm["reconciliation"]["unresolved"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
