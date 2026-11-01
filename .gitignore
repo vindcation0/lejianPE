@@ -1,6 +1,8 @@
 # ===== 凭据：绝对不要提交 =====
 # 含 accessToken / refreshToken / 学号 / 手机号 / 真实姓名
 state.json
+# 由抓包提取的账号与登录签名（等价于半个凭据）
+credential.json
 
 # ===== 抓包与导出：体积大且含个人数据 =====
 captures/

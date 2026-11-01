@@ -16,7 +16,9 @@ ACTIONS = [
     ("t", "可视化编辑课表（网页版）", ["tools/editor_server.py"]),
     ("7", "查看所有课程名（填配置用）", ["lejian.py", "names"]),
     ("8", "强制刷新 token", ["lejian.py", "refresh"]),
-    ("9", "从模拟器 App 重新同步 token", ["tools/resync_from_app.py"]),
+    ("9", "账号密码登录（命令行）", ["tools/login_cli.py"]),
+    ("b", "重新抓取登录签名（改密码后用）", ["tools/capture_login.py"]),
+    ("a", "从模拟器 App 同步 Token（备用）", ["tools/resync_from_app.py"]),
 ]
 
 
