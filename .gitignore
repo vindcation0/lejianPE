@@ -1,11 +1,22 @@
-# ===== 凭据：绝对不要提交 =====
-# 含 accessToken / refreshToken / 学号 / 手机号 / 真实姓名
+# ===== 凭据安全：绝对不要提交 =====
+# 含 accessToken / refreshToken / 学号 / 手机号 / 真实姓名 / signDigital
 state.json
-# 由抓包提取的账号与登录签名（等价于半个凭据）
+state.json.*
 credential.json
+credential.*
+!credential.example.json
+credentials/
+*.key
+
+# 临时与备份产物
+*.tmp
+*.bak
 
 # ===== 抓包与导出：体积大且含个人数据 =====
 captures/
+*.capture
+*.mitm
+*.flows
 
 # ===== 运行产物 =====
 logs/
@@ -14,7 +25,6 @@ data/
 *.db-wal
 *.db-shm
 *.lock
-*.bak
 __pycache__/
 *.pyc
 *.pyo

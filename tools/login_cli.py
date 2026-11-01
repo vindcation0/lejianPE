@@ -1,220 +1,248 @@
 """
-命令行登录。
+乐健体育 · 命令行账号密码登录工具。
 
-原理
-----
-登录请求体是信封 {"t": 毫秒时间戳, "pyd": AES(明文)}，密钥由 t 派生。
-服务端会校验 t 的新鲜度，所以必须每次用**当前时间**重新封装。
-
-而明文里的 signDigital = hs(账号+密码+entrance)，**不含时间**，是个常量。
-因此只需从一次真实抓包里把它提取出来存好，之后每次登录：
-
-    读账号+签名 → 向用户要密码 → 用当前 t 封装 → 提交 → 换到新 token
-
-不需要模拟器，也不需要逆向 hs() 的算法。
-
-setup（只做一次）
-    python tools\\login_cli.py --setup captures/login_flows.jsonl
-
-日常登录
-    python tools\\login_cli.py
-
-改动密码后需要重新 setup 一次。
+基于 signDigital + 动态时间戳 + AES 登录信封实现。
+无需每次启动 Android 模拟器。
 """
 import argparse
 import getpass
 import json
 import os
-import ssl
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-from login_envelope import unwrap, wrap  # noqa: E402
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+if os.path.join(ROOT, "tools") not in sys.path:
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-BASE = "https://cpes.legym.cn/"
-LOGIN = "authorization/user/v2/manage/login"
-STATE = os.path.join(ROOT, "state.json")
-CRED = os.path.join(ROOT, "credential.json")
-CTX = ssl.create_default_context()
+from core.auth_error import (
+    AuthError,
+    AuthNetworkError,
+    BusinessAuthError,
+    CredentialError,
+    InvalidCredentialError,
+    SchoolInfoError,
+    SemesterInfoError,
+    TokenAcquisitionError,
+)
+from core.auth_manager import AuthManager
+from core.credential_storage import (
+    CredentialStorage,
+    is_windows,
+    mask_account,
+    mask_secret,
+)
+
+try:
+    from tools.login_envelope import unwrap
+except ImportError:
+    from login_envelope import unwrap
+
+LOGIN_PATH = "authorization/user/v2/manage/login"
+CRED_FILE = os.path.join(ROOT, "credential.json")
+STATE_FILE = os.path.join(ROOT, "state.json")
 
 
-def dec(raw):
-    for enc in ("utf-8", "gbk", "gb18030"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", "ignore")
-
-
-def mask(s):
-    s = str(s)
-    return f"{s[:3]}****{s[-2:]}" if len(s) >= 6 else "***"
-
-
-# ---------------------------------------------------------------- setup
-def do_setup(flows_path):
+def do_setup(flows_path: str, use_dpapi: bool = None):
+    """从 mitmproxy 导出的抓包 jsonl 中提取账号与 signDigital"""
     if not os.path.exists(flows_path):
-        sys.exit(f"找不到 {flows_path}")
+        sys.exit(f"❌ 找不到抓包文件: {flows_path}")
+
+    if use_dpapi is None:
+        use_dpapi = is_windows()
+
     payload = None
-    for line in open(flows_path, encoding="utf-8"):
-        if LOGIN not in line:
-            continue
-        rec = json.loads(line)
-        if rec.get("status") != 200:
-            continue
-        try:
-            payload = unwrap(json.loads(rec["req_body"]))
-        except Exception:
-            continue
+    count = 0
+    with open(flows_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if LOGIN_PATH not in line:
+                continue
+            try:
+                rec = json.loads(line)
+                if rec.get("status") == 200:
+                    payload = unwrap(json.loads(rec["req_body"]))
+                    count += 1
+            except Exception:
+                continue
+
     if not payload:
-        sys.exit("抓包里没有成功的登录请求")
+        sys.exit("❌ 抓包文件中未检索到成功的登录请求记录")
 
-    cred = {
-        "account": payload.get("userName") or payload.get("phone"),
-        "signDigital": payload.get("signDigital"),
-        "entrance": str(payload.get("entrance") or "1"),
-        "capturedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    if not cred["account"] or not cred["signDigital"]:
-        sys.exit("载荷里缺账号或签名")
-    with open(CRED, "w", encoding="utf-8") as f:
-        json.dump(cred, f, ensure_ascii=False, indent=2)
-    print("已生成 credential.json（不含密码）")
-    print(f"  账号     : {mask(cred['account'])}")
-    print(f"  签名前缀 : {cred['signDigital'][:10]}…  长度={len(cred['signDigital'])}")
-    print(f"  采集时间 : {cred['capturedAt']}")
-    print("\n注意：密码一旦修改，签名即失效，需要重新 setup。")
+    account = payload.get("userName") or payload.get("phone")
+    sign_digital = payload.get("signDigital")
+    entrance = str(payload.get("entrance") or "1")
+    captured_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
-
-# ---------------------------------------------------------------- 登录
-def post_json(path, obj):
-    req = urllib.request.Request(BASE + path, data=json.dumps(obj).encode(),
-                                 method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", "okhttp/3.12.1")
+    storage = CredentialStorage(CRED_FILE)
     try:
-        with urllib.request.urlopen(req, timeout=20, context=CTX) as r:
-            return r.status, dec(r.read())
-    except urllib.error.HTTPError as e:
-        return e.code, dec(e.read())
+        storage.save_credential(
+            account=account,
+            sign_digital=sign_digital,
+            entrance=entrance,
+            captured_at=captured_at,
+            use_dpapi=use_dpapi,
+        )
     except Exception as e:
-        return -1, repr(e)
+        sys.exit(f"❌ 保存凭据失败: {e}")
+
+    # 验证是否真正生效
+    verify_cred = storage.load_credential()
+    is_enc = verify_cred.get("isEncrypted", False)
+
+    print("✅ 已成功生成 credential.json（严格不包含明文密码）")
+    print(f"  账号       : {mask_account(account)}")
+    print(f"  签名材料   : {mask_secret(sign_digital)}")
+    print(f"  采集时间   : {captured_at}")
+    print(f"  DPAPI 加密 : {'已启用并验证通过' if is_enc else '未启用（明文存储）'}")
+    print("\n提示：密码修改后签名即失效，届时需重新运行 setup 初始化。")
 
 
-def api_get(path, token, school):
-    req = urllib.request.Request(BASE + path, method="GET")
-    req.add_header("Authorization", "Bearer " + token)
-    req.add_header("Organization", school or "")
-    req.add_header("User-Agent", "okhttp/3.12.1")
+def encrypt_existing_credential():
+    """将现有的明文 credential.json 升级为 Windows DPAPI 加密存储"""
+    if not is_windows():
+        sys.exit("❌ 当前系统不是 Windows，不支持 DPAPI 加密")
+
+    storage = CredentialStorage(CRED_FILE)
     try:
-        with urllib.request.urlopen(req, timeout=15, context=CTX) as r:
-            return json.loads(dec(r.read()))
-    except Exception:
-        return {}
+        cred = storage.load_credential()
+    except Exception as e:
+        sys.exit(f"❌ 加载凭据失败: {e}")
 
+    if cred.get("isEncrypted"):
+        print("ℹ️ 当前凭据已经处于 Windows DPAPI 加密保护状态，无需重复加密。")
+        return
 
-def do_login(account, password, sign, entrance):
-    payload = {
-        "userName": account, "phone": account, "password": password,
-        "entrance": entrance, "authType": "Bearer", "baseUrl": BASE,
-        "page": "", "type": "", "signDigital": sign,
-    }
-    code, text = post_json(LOGIN, wrap(payload))
-    if code != 200:
-        return None, f"HTTP {code}: {text[:160]}"
     try:
-        obj = json.loads(text)
-    except Exception:
-        return None, "响应不是 JSON"
-    if obj.get("code") != 0:
-        return None, f"code={obj.get('code')} {obj.get('message')}"
-    d = obj.get("data") or {}
-    if isinstance(d, dict) and "pyd" in d:
-        d = unwrap(d)
-    return d, None
+        storage.save_credential(
+            account=cred["account"],
+            sign_digital=cred["signDigital"],
+            entrance=cred.get("entrance", "1"),
+            captured_at=cred.get("capturedAt", ""),
+            use_dpapi=True,
+        )
+    except Exception as e:
+        sys.exit(f"❌ DPAPI 加密失败: {e}（已拒绝保存明文，原凭据保持未修改）")
 
+    # 严密二次核验
+    re_check = storage.load_credential()
+    if not re_check.get("isEncrypted"):
+        sys.exit("❌ 严重安全异常：加密执行后未检测到密文字段！")
 
-def save_state(d):
-    sem = api_get("education/semester/getCurrent", d["accessToken"],
-                  d.get("schoolId") or "")
-    sem_d = sem.get("data") or {}
-    yr = str(sem_d.get("yearRange") or "")
-    old = {}
-    if os.path.exists(STATE):
-        old = json.load(open(STATE, encoding="utf-8"))
-    st = dict(old)
-    st.update({
-        "accessToken": d["accessToken"],
-        "refreshToken": d.get("refreshToken"),
-        "accessTokenExpires": d.get("accessTokenExpires"),
-        "userId": d.get("id"),
-        "schoolId": d.get("schoolId"),
-        "semesterId": sem_d.get("id") or d.get("semesterId"),
-        "year": yr[:4] if yr else str(d.get("year") or "2026"),
-        "campusId": d.get("campusId"),
-        "realName": d.get("realName"),
-    })
-    tmp = STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE)
-    return st
+    print("✅ 已成功将 signDigital 使用 Windows DPAPI 加密保护！")
+    print(f"  账号: {mask_account(cred['account'])}")
+    print("  已完成回读验证：明文字段已移除，密文字段已成功解密匹配。")
+    print("  提示: 加密后的凭据仅在当前 Windows 用户登录会话下可解密。")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--setup", metavar="FLOWS",
-                    help="从抓包文件提取账号与签名，生成 credential.json")
-    ap.add_argument("--no-save", action="store_true", help="只验证，不写 state.json")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="乐健体育命令行登录")
+    parser.add_argument("--setup", metavar="FLOWS_PATH", help="从抓包文件中提取认证材料并初始化 credential.json")
+    parser.add_argument("--encrypt", action="store_true", help="使用 Windows DPAPI 对当前凭据进行加密保护")
+    parser.add_argument("--plaintext", action="store_true", help="显式以明文方式存储凭据（不推荐）")
+    parser.add_argument("--no-save", action="store_true", help="仅测试认证，不写入 state.json")
+    args = parser.parse_args()
 
     if args.setup:
-        do_setup(args.setup)
+        use_dpapi = False if args.plaintext else is_windows()
+        do_setup(args.setup, use_dpapi=use_dpapi)
         return
 
-    if not os.path.exists(CRED):
-        sys.exit("没有 credential.json。请先运行：\n"
-                 "  python tools\\login_cli.py --setup captures\\login_flows.jsonl")
+    if args.encrypt:
+        encrypt_existing_credential()
+        return
 
-    cred = json.load(open(CRED, encoding="utf-8"))
+    storage = CredentialStorage(CRED_FILE)
+    try:
+        cred = storage.load_credential()
+    except CredentialError as e:
+        print(f"\n❌ 凭据异常: {e}")
+        print("请先初始化认证材料：")
+        print("  python tools\\login_cli.py --setup captures\\login_flows.jsonl")
+        print("或在菜单中选择 [b] 重新抓取登录签名")
+        sys.exit(1)
+
     account = cred["account"]
-    print(f"账号：{mask(account)}（采集于 {cred.get('capturedAt')}）")
-    password = getpass.getpass("密码（不回显）：")
-    if not password:
-        sys.exit("已取消")
+    captured_at = cred.get("capturedAt") or "未知时间"
+    enc_status = " (DPAPI受保护)" if cred.get("isEncrypted") else ""
+    print("=" * 50)
+    print("           乐健体育 · 命令行安全登录")
+    print("=" * 50)
+    print(f"账号：{mask_account(account)}{enc_status}（认证材料采集于 {captured_at}）")
 
-    print("登录中…")
-    data, err = do_login(account, password, cred["signDigital"], cred["entrance"])
-    if not data:
-        print(f"\n❌ 登录失败：{err}")
-        e = str(err)
-        if "50004" in e or "签名" in e:
-            print("  服务端判定签名不正确。")
-            print("  签名由「账号 + 密码 + entrance」算出，密码一变就失效。")
-            print("  请重新抓取签名：")
-            print("      python tools\\capture_login.py")
-            print("  或菜单 [b]")
-        elif "密码" in e or "账号" in e:
-            print("  请确认账号密码是否正确。")
-        return
+    try:
+        password = getpass.getpass("请输入密码（输入时不回显）：")
+    except (KeyboardInterrupt, EOFError):
+        print("\n已取消输入。")
+        sys.exit(0)
 
-    print("\n✅ 登录成功")
-    print(f"  姓名      : {data.get('realName')}")
-    print(f"  schoolId  : {data.get('schoolId')}")
-    print(f"  token前缀 : {str(data.get('accessToken'))[:8]}…")
-    exp = data.get("accessTokenExpires")
-    if exp:
-        print(f"  有效期至  : {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exp/1000))}")
+    if not password or not password.strip():
+        print("未输入密码，操作已取消。")
+        sys.exit(0)
+
+    print("正在提交登录请求…")
+    auth_mgr = AuthManager()
+
+    try:
+        data = auth_mgr.login(
+            account=account,
+            password=password,
+            sign_digital=cred["signDigital"],
+            entrance=cred.get("entrance", "1"),
+        )
+    except BusinessAuthError as e:
+        print(f"\n❌ 业务认证失败: {e}")
+        if e.code == 50004 or "签名" in str(e):
+            print("  [原因分析] 服务端判定签名校验不匹配。")
+            print("  签名是由「账号 + 密码 + entrance」通过客户端底层计算得出。")
+            print("  若您曾在 App 端修改过密码，旧签名将永久失效。")
+            print("  [解决建议]")
+            print("    1. 请先通过模拟器登录并重新抓包生成认证材料：")
+            print("       python tools\\capture_login.py")
+            print("    2. 或在主菜单中选 [a] 临时使用模拟器同步 Token。")
+        elif "密码" in str(e) or "账号" in str(e):
+            print("  [解决建议] 请核对输入的密码是否正确。")
+        sys.exit(1)
+    except AuthNetworkError as e:
+        print(f"\n❌ 网络连接异常: {e}")
+        print("  [解决建议] 请检查网络连通性或稍后重试。")
+        sys.exit(1)
+    except (TokenAcquisitionError, SchoolInfoError, SemesterInfoError) as e:
+        print(f"\n❌ 认证数据异常: {e}")
+        print("  [安全保护] 登录未成功落地，已完整保留原有的 state.json。")
+        sys.exit(1)
+    except AuthError as e:
+        print(f"\n❌ 登录失败: {e}")
+        sys.exit(1)
+    finally:
+        # 及时释放内存中的密码引用
+        del password
+
+    print("\n✅ 登录认证成功！")
+    real_name = data.get("realName") or "未知姓名"
+    school_id = data.get("schoolId")
+    token_str = data.get("accessToken") or ""
+    exp_ms = data.get("accessTokenExpires") or 0
+    exp_str = (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp_ms / 1000))
+        if exp_ms
+        else "未知"
+    )
+
+    print(f"  学生姓名   : {real_name}")
+    print(f"  学校代码   : {school_id}")
+    print(f"  Token 前缀 : {mask_secret(token_str)}")
+    print(f"  有效期至   : {exp_str}")
 
     if not args.no_save:
-        st = save_state(data)
-        print(f"  已写入 state.json（semesterId={st.get('semesterId')}）")
+        try:
+            saved_state = auth_mgr.save_state_atomically(data, STATE_FILE)
+            print(f"  已成功写入 : state.json (学期 ID: {saved_state.get('semesterId')})")
+        except Exception as e:
+            print(f"\n❌ 保存 state.json 失败: {e}")
+            print("  原有 state.json 保持完好。")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

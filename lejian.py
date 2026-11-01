@@ -969,11 +969,17 @@ def _cmd_grab_inner(cfg, st):
         log(f"自动生成 Markdown 报告异常: {e}")
 
 
+def cmd_login():
+    """账号密码安全登录（命令行模式）"""
+    from tools.login_cli import main as login_main
+    login_main()
+
+
 def cmd_refresh():
     """强制刷新 token（不等过期）"""
     st = load_json(STATE)
     if not st:
-        sys.exit("没有 state.json，先跑: python tools\\resync_from_app.py")
+        sys.exit("没有 state.json，请先运行: python lejian.py login 或 python tools\\login_cli.py")
     c = Client(st)
     log(f"当前 token 剩余 {int(c.expires_in())} 秒")
     try:
@@ -981,9 +987,9 @@ def cmd_refresh():
         log("刷新成功，已写回 state.json")
     except Exception as e:
         log(f"刷新失败: {e}")
-        log("说明 refreshToken 也失效了。需要：")
-        log("  1. 在模拟器里重新登录乐健体育")
-        log("  2. 双击 run.bat 选 [8] 从 App 重新同步")
+        log("说明 refreshToken 也已失效。建议：")
+        log("  1. 运行 python lejian.py login 或双击 run.bat 选 [9] 进行命令行登录（推荐）")
+        log("  2. 或在模拟器里重新登录后选 [a] 从 App 重新同步 Token（备用）")
 
 
 def cmd_names():
@@ -1087,7 +1093,8 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     {"status": cmd_status, "list": cmd_list, "grab": cmd_grab,
      "timetable": cmd_timetable, "names": cmd_names,
-     "refresh": cmd_refresh, "editor": cmd_editor}.get(cmd, cmd_status)()
+     "refresh": cmd_refresh, "editor": cmd_editor,
+     "login": cmd_login}.get(cmd, cmd_status)()
 
 
 if __name__ == "__main__":
