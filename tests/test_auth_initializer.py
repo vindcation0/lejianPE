@@ -363,9 +363,9 @@ class AuthInitializerTestSuite(unittest.TestCase):
     # ==================== I15: 全方位敏感信息脱敏校验 ====================
     def test_I15_reinitialize_security_masking(self):
         """I15: 验证整个初始化流程的所有标准输出中绝对不泄漏密码明文与完整签名"""
-        secret_pwd = "TopSecretReinitPassword888!"
-        secret_sig = "9876543210abcdef9876543210fedcba"
-        self._create_mock_flows(account="13800138000", sign_digital=secret_sig, entrance="1")
+        mock_pwd = "TopSecretReinitPassword888!"
+        mock_sign_digital = "9876543210abcdef9876543210fedcba"
+        self._create_mock_flows(account="13800138000", sign_digital=mock_sign_digital, entrance="1")
 
         stdout_buf = io.StringIO()
         mock_login_data = {
@@ -377,14 +377,14 @@ class AuthInitializerTestSuite(unittest.TestCase):
              patch.object(self.initializer.auth_manager, "fetch_semester_info", return_value=("sem_1", "2026", None)), \
              patch("sys.stdout", stdout_buf):
             self.initializer.reinitialize(
-                password=secret_pwd,
+                password=mock_pwd,
                 flows_path=self.flows_path,
                 interactive=True,
             )
 
         out = stdout_buf.getvalue()
-        self.assertNotIn(secret_pwd, out, "密码明文泄漏在标准输出中！")
-        self.assertNotIn(secret_sig, out, "完整签名材料泄漏在标准输出中！")
+        self.assertNotIn(mock_pwd, out, "密码明文泄漏在标准输出中！")
+        self.assertNotIn(mock_sign_digital, out, "完整签名材料泄漏在标准输出中！")
         self.assertIn("138****8000", out)
 
     # ==================== I16: lejian.py reinit 与 menu.py 统一路由 ====================
