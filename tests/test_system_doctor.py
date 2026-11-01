@@ -321,6 +321,8 @@ class SystemDoctorTestSuite(unittest.TestCase):
         self.assertIsNotNone(db_item)
         self.assertEqual(db_item.status, "ERROR")
         self.assertEqual(report.overall_status, "ERROR")
+        self.assertIn("corrupt.bak", db_item.suggestion)
+        self.assertIn("复核已选活动", db_item.suggestion)
 
     # -------------------------------------------------------------------------
     # D11: 工作目录无写权限
@@ -473,33 +475,54 @@ class SystemDoctorTestSuite(unittest.TestCase):
     # D17: 纯只读保证校验 (执行体检不改变任何现有文件与数据)
     # -------------------------------------------------------------------------
     def test_D17_pure_read_only_guarantee(self):
-        """D17: 非破坏性只读验证：体检执行前后关键凭据/会话/DB SHA-256 绝对一致，临时探测文件被立即清理"""
+        """D17: 非破坏性只读验证：体检前后五大关键文件 SHA-256、大小与修改时间绝对一致，SQLite mode=ro 拒绝写入，临时探测文件被立即清理"""
         import hashlib
         self._setup_healthy_environment()
 
-        def sha256_of(file_path):
+        def get_file_meta(file_path):
             h = hashlib.sha256()
             with open(file_path, "rb") as f:
                 h.update(f.read())
-            return h.hexdigest()
+            return {
+                "sha256": h.hexdigest(),
+                "size": os.path.getsize(file_path),
+                "mtime": os.path.getmtime(file_path),
+            }
 
-        before_cred_sha = sha256_of(self.cred_path)
-        before_state_sha = sha256_of(self.state_path)
-        before_db_sha = sha256_of(self.db_path)
+        target_files = [
+            self.cred_path,
+            self.state_path,
+            self.config_path,
+            self.timetable_path,
+            self.db_path,
+        ]
+
+        before_metas = {fp: get_file_meta(fp) for fp in target_files}
 
         doctor = SystemDoctor(root_dir=self.test_dir)
         report = doctor.run_diagnostics(online_probe=False)
 
-        after_cred_sha = sha256_of(self.cred_path)
-        after_state_sha = sha256_of(self.state_path)
-        after_db_sha = sha256_of(self.db_path)
+        after_metas = {fp: get_file_meta(fp) for fp in target_files}
 
-        # 密码学哈希比对，验证数据字节级绝对不可变
-        self.assertEqual(before_cred_sha, after_cred_sha)
-        self.assertEqual(before_state_sha, after_state_sha)
-        self.assertEqual(before_db_sha, after_db_sha)
+        # 1. 密码学哈希、大小与 mtime 全面比对，验证数据字节级绝对不可变
+        for fp in target_files:
+            fname = os.path.basename(fp)
+            self.assertEqual(before_metas[fp]["sha256"], after_metas[fp]["sha256"], f"{fname} SHA-256 发生改变！")
+            self.assertEqual(before_metas[fp]["size"], after_metas[fp]["size"], f"{fname} 大小发生改变！")
+            self.assertEqual(before_metas[fp]["mtime"], after_metas[fp]["mtime"], f"{fname} mtime 发生改变！")
 
-        # 确认没有残留探针临时文件
+        # 2. 验证 SQLite mode=ro URI 只读连接拒绝任何写操作 (抛出 OperationalError)
+        db_abs = os.path.abspath(self.db_path)
+        ro_uri = f"file:{db_abs}?mode=ro"
+        ro_conn = sqlite3.connect(ro_uri, uri=True)
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                ro_conn.execute("INSERT INTO registration_records VALUES ('act_illegal', '只读探测', 'FAIL');")
+            self.assertIn("readonly", str(ctx.exception).lower())
+        finally:
+            ro_conn.close()
+
+        # 3. 确认没有残留探针临时文件
         for root, _, files in os.walk(self.test_dir):
             for fname in files:
                 self.assertFalse(fname.startswith(".doctor_probe_"), f"存在未清理临时文件: {fname}")

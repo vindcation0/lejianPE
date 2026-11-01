@@ -386,7 +386,7 @@ class SystemDoctor:
                         name="SQLite 状态库",
                         status="ERROR",
                         message=f"数据库完整性损坏: {row[0] if row else '未知错误'}",
-                        suggestion="建议备份后重置 data/registration.db 数据库。",
+                        suggestion="数据库损坏，建议先将 data/registration.db 备份为 .corrupt.bak，然后删除原文件由程序自动重建，并运行 python lejian.py list 复核已选活动。",
                     ))
             except Exception as e:
                 report.checks.append(CheckItem(
@@ -394,7 +394,7 @@ class SystemDoctor:
                     name="SQLite 状态库",
                     status="ERROR",
                     message=f"访问数据库异常: {e}",
-                    suggestion="请检查 data/registration.db 是否被独占占用或文件损坏。",
+                    suggestion="数据库损坏或被独占占用，建议先将 data/registration.db 备份为 .corrupt.bak，然后删除原文件由程序自动重建，并运行 python lejian.py list 复核已选活动。",
                 ))
 
         # config.json 检查

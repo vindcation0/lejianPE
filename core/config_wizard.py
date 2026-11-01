@@ -594,7 +594,7 @@ class ConfigWizard:
             print("-" * 55)
             print("【安全声明】")
             print("• 密码输入使用标准不回显机制，绝不以明文形式保存于磁盘或日志；")
-            print("• 凭据在 Windows 下默认采用硬件 DPAPI 级安全加密保护；")
+            print("• 凭据在 Windows 下默认采用 DPAPI 凭据安全加密保护（基于 Windows 用户安全上下文）；")
             print("• 采用 WAL 复合事务，任何步骤失败绝不留存残损配置。")
             print("=" * 55)
             try:
