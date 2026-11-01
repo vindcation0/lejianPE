@@ -40,7 +40,7 @@ from core.auth_error import (
     SemesterInfoError,
     TokenAcquisitionError,
 )
-from core.credential_storage import mask_account, mask_secret
+from core.credential_storage import mask_account, mask_secret, secure_file_permissions
 
 BASE_URL = "https://cpes.legym.cn/"
 LOGIN_PATH = "authorization/user/v2/manage/login"
@@ -330,6 +330,7 @@ class AuthManager:
         if backup and os.path.exists(state_path):
             try:
                 shutil.copy2(state_path, bak_path)
+                secure_file_permissions(bak_path)
             except Exception as e:
                 raise AuthError(f"备份原有会话失败: {e}。为防止旧数据丢失，已拒绝保存！原有会话未被修改。") from e
 
@@ -339,6 +340,12 @@ class AuthManager:
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(new_state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            secure_file_permissions(tmp_path)
 
             # 校验临时文件完整性
             with open(tmp_path, "r", encoding="utf-8") as f:
@@ -350,6 +357,7 @@ class AuthManager:
 
             # 原子替换
             os.replace(tmp_path, state_path)
+            secure_file_permissions(state_path)
         except Exception as e:
             # 清理损坏的临时文件，若有备份且目标损坏则尝试恢复
             if os.path.exists(tmp_path):

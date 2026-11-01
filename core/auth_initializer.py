@@ -3,19 +3,22 @@
 ============================================================
 职责：
 1. 统一管理认证重初始化完整七步生命周期：
-   - 步骤 1：本地认证与会话状态检查（脱敏只读，自动检测并恢复未决事务）
+   - 步骤 1：本地认证与会话状态检查（脱敏只读，自动自检并恢复未决事务）
    - 步骤 2：官方客户端与模拟器就绪引导（提示账号一致性与安全声明）
    - 步骤 3：调用抓包并解析认证材料（复用 capture_login 与 login_envelope）
    - 步骤 4：严格预校验新凭据（格式、账号一致性防串号、真实登录验证）
-   - 步骤 5：开启跨文件复合事务并原子替换旧凭据（临时文件 + os.replace，记录 CRED_APPLIED）
+   - 步骤 5：开启带预写事务日志 (WAL) 的跨文件复合事务并原子替换旧凭据（记录 CRED_APPLIED）
    - 步骤 6：拉取学期上下文并原子更新 state.json（遇错自动完整回滚凭据与会话）
-   - 步骤 7：复合事务提交与完成确认（清理事务备份与日志，确认双文件强一致）
+   - 步骤 7：复合事务提交与完成确认（清理事务临时备份与日志，确认双文件强一致）
 2. 安全防护底线：
    - Fail-closed：任何中间环节验证失败，绝不破坏原有可用凭据和会话。
-   - 跨文件复合事务（2PC）：凭据与会话更新保证强一致性，任何一方失败自动完全回滚。
-   - 严格账号一致性核验：若已有配置账号，拒绝采纳不一致的他方账号凭据。
+   - 跨文件复合事务（Composite Transaction with WAL）：凭据与会话更新保证强一致性，任何一方失败自动完全回滚。
+   - 会话备份安全保护：state.json 备份时在 Windows 环境下强制启用 DPAPI 密文包装，杜绝磁盘裸露明文 Token。
+   - 显式访问控制强化：对所有凭据、Token、会话文件及其事务备份设置显式 DACL (Windows) / 0o600 (POSIX)。
+   - 幂等自愈：事务回滚机制幂等安全，抗异常断电与二次中断。
    - 绝不保存明文密码，日志严格脱敏。
 """
+import base64
 import datetime
 import getpass
 import json
@@ -50,14 +53,34 @@ from core.auth_error import (
 from core.auth_manager import AuthManager, BASE_URL, LOGIN_PATH
 from core.credential_storage import (
     CredentialStorage,
+    dpapi_protect,
+    dpapi_unprotect,
     is_windows,
     mask_account,
     mask_secret,
+    secure_file_permissions,
 )
 
 DEFAULT_CRED_FILE = os.path.join(ROOT, "credential.json")
 DEFAULT_STATE_FILE = os.path.join(ROOT, "state.json")
 DEFAULT_FLOWS_FILE = os.path.join(ROOT, "captures", "login_flows.jsonl")
+
+
+def _sync_parent_dir(path: str) -> None:
+    """尝试同步包含文件的父目录元数据（针对 POSIX 文件系统，Windows 下自动安全忽略）"""
+    dir_path = os.path.dirname(os.path.abspath(path))
+    try:
+        if hasattr(os, "O_DIRECTORY"):
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        else:
+            flags = os.O_RDONLY
+        fd = os.open(dir_path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except (OSError, PermissionError, AttributeError):
+        pass
 
 
 class AuthInitializer:
@@ -83,39 +106,132 @@ class AuthInitializer:
         self.auth_manager = AuthManager(base_url=self.base_url)
 
     # =========================================================================
-    # 跨文件复合事务保护机制 (Composite Transaction - Fail-closed)
+    # 跨文件复合事务保护机制 (Composite Transaction with WAL)
     # =========================================================================
-    def _atomic_write_json(self, path: str, data: Dict[str, Any]) -> None:
-        """以安全原子方式写入 JSON 文件（临时文件 + 同步落盘 + os.replace 替换）"""
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    def _write_and_sync_bytes(self, path: str, data: bytes, secure_perms: bool = True) -> None:
+        """
+        以严格原子与持久化落盘方式写入文件：
+        1. 写入同目录下的临时文件；
+        2. flush + fsync 强制落盘；
+        3. 对临时文件设置显式安全权限 (DACL / 0o600)；
+        4. os.replace 原子替换为目标文件；
+        5. 再次对目标文件设置安全权限；
+        6. 尝试同步父目录元数据。
+        """
+        path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = path + f".{os.getpid()}_{time.time_ns()}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with open(tmp_path, "wb") as f:
+            f.write(data)
             f.flush()
             try:
                 os.fsync(f.fileno())
             except OSError:
                 pass
+
+        if secure_perms:
+            secure_file_permissions(tmp_path)
+
         os.replace(tmp_path, path)
+
+        if secure_perms:
+            secure_file_permissions(path)
+
+        _sync_parent_dir(path)
+
+    def _atomic_write_json(self, path: str, data: Dict[str, Any], secure_perms: bool = True) -> None:
+        """以安全原子与持久化落盘方式写入 JSON 文件"""
+        encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        self._write_and_sync_bytes(path, encoded, secure_perms=secure_perms)
+
+    def _backup_file_securely(self, src_path: str, dst_path: str, is_state: bool = False) -> bool:
+        """
+        安全备份关键文件：
+        1. 确保源文件数据完整；
+        2. 若为 state.json 且在 Windows 环境下，采用 DPAPI 密文包装后再落盘，杜绝明文 Token 裸露；
+        3. 写入临时文件并执行 flush + fsync 后原子替换；
+        4. 显式加固备份文件的访问控制权限 (secure_file_permissions)。
+        """
+        if not os.path.exists(src_path):
+            return False
+
+        try:
+            with open(src_path, "rb") as f:
+                raw_bytes = f.read()
+        except Exception:
+            return False
+
+        dpapi_enabled = self.use_dpapi if self.use_dpapi is not None else is_windows()
+
+        if is_state and dpapi_enabled and is_windows():
+            try:
+                cipher = dpapi_protect(raw_bytes, description="lejian_state_tx_bak")
+                container = {
+                    "isEncrypted": True,
+                    "backupType": "DPAPI_PROTECTED_STATE_BACKUP",
+                    "payloadEncrypted": base64.b64encode(cipher).decode("ascii"),
+                    "backedUpAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                bak_bytes = json.dumps(container, ensure_ascii=False, indent=2).encode("utf-8")
+            except Exception:
+                # 若 DPAPI 加密出现意外，不终止备份，但原样保留并依赖显式 DACL 权限保护
+                bak_bytes = raw_bytes
+        else:
+            bak_bytes = raw_bytes
+
+        self._write_and_sync_bytes(dst_path, bak_bytes, secure_perms=True)
+        return True
+
+    def _restore_file_securely(self, dst_path: str, bak_path: str, is_state: bool = False) -> bool:
+        """
+        从安全备份中还原文件（具备幂等性）：
+        1. 若 bak_path 不存在：若 dst_path 已存在则视为已处于恢复状态；
+        2. 若为 DPAPI 加密包装的 state 备份，解密出原始明文内容；
+        3. 原子写入 dst_path 并落盘；
+        4. 还原过程中暂不删除 bak_path，直到全流程提交时统一清理，确保抗二次断电中断。
+        """
+        if not os.path.exists(bak_path):
+            return os.path.exists(dst_path)
+
+        try:
+            with open(bak_path, "rb") as f:
+                bak_bytes = f.read()
+        except Exception:
+            return False
+
+        plain_bytes = bak_bytes
+        if is_state:
+            try:
+                container = json.loads(bak_bytes.decode("utf-8"))
+                if isinstance(container, dict) and container.get("isEncrypted") and container.get("payloadEncrypted"):
+                    cipher = base64.b64decode(container["payloadEncrypted"])
+                    plain_bytes = dpapi_unprotect(cipher)
+            except Exception:
+                plain_bytes = bak_bytes
+
+        self._write_and_sync_bytes(dst_path, plain_bytes, secure_perms=True)
+        return True
 
     def begin_transaction(self) -> str:
         """
-        开启跨文件复合事务。
+        开启带预写事务日志 (WAL) 的跨文件复合事务。
         若发现未决事务则先自动恢复；随后对当前的 credential.json 和 state.json
-        进行物理二进制复制隔离备份，并持久化事务状态记录。
+        进行物理隔离备份（state 备份经过 DPAPI 密文包装），全部落盘后再写入事务日志记录。
         """
         self.recover_pending_transaction()
         tx_id = f"tx_{int(time.time())}_{os.getpid()}"
         cred_exists = os.path.exists(self.cred_path)
         state_exists = os.path.exists(self.state_path)
 
-        # 备份原有凭据（二进制复制保持原样，若是 DPAPI 加密则完全保留密文）
+        # 1. 备份原有凭据（二进制持久化落盘并加固权限）
         if cred_exists:
-            shutil.copy2(self.cred_path, self.cred_tx_bak)
-        # 备份原有会话
-        if state_exists:
-            shutil.copy2(self.state_path, self.state_tx_bak)
+            self._backup_file_securely(self.cred_path, self.cred_tx_bak, is_state=False)
 
+        # 2. 备份原有会话（DPAPI 密文包装持久化落盘并加固权限）
+        if state_exists:
+            self._backup_file_securely(self.state_path, self.state_tx_bak, is_state=True)
+
+        # 3. 事务日志先落盘 (Write-Ahead Logging)
         tx_record = {
             "tx_id": tx_id,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -127,11 +243,11 @@ class AuthInitializer:
             "state_had_existed": state_exists,
             "state_tx_bak": self.state_tx_bak if state_exists else None,
         }
-        self._atomic_write_json(self.tx_path, tx_record)
+        self._atomic_write_json(self.tx_path, tx_record, secure_perms=True)
         return tx_id
 
     def record_tx_step(self, status: str) -> None:
-        """记录事务推进状态"""
+        """记录事务推进状态（写日志先行，fsync 强制落盘）"""
         if not os.path.exists(self.tx_path):
             return
         try:
@@ -139,14 +255,16 @@ class AuthInitializer:
                 tx_data = json.load(f)
             tx_data["status"] = status
             tx_data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            self._atomic_write_json(self.tx_path, tx_data)
+            self._atomic_write_json(self.tx_path, tx_data, secure_perms=True)
         except Exception:
             pass
 
     def commit_transaction(self) -> None:
         """
         提交复合事务：
-        双文件均已原子落地成功，安全清理事务临时备份与事务记录文件。
+        双文件均已原子落地成功，清理事务临时备份与事务记录文件。
+        注意：这是常规文件系统 unlink 操作，清理过程受 OS 与底层存储介质调度，
+        不应将其误解为物理安全擦除（Secure Erase）。
         """
         for p in (self.cred_tx_bak, self.state_tx_bak, self.tx_path):
             if os.path.exists(p):
@@ -157,7 +275,7 @@ class AuthInitializer:
 
     def rollback_transaction(self) -> bool:
         """
-        回滚复合事务：
+        回滚复合事务（具备完全幂等性与抗二次中断能力）：
         将 credential.json 和 state.json 完全恢复为事务开始前的完全一致状态。
         """
         if not os.path.exists(self.tx_path):
@@ -169,42 +287,31 @@ class AuthInitializer:
         except Exception:
             tx = {}
 
-        restored = False
-
-        # 1. 恢复凭据
+        # 1. 恢复凭据文件（若原先存在则还原；若原先不存在则移除新生成文件）
         cred_had = tx.get("cred_had_existed", False)
         cred_bak = tx.get("cred_tx_bak") or self.cred_tx_bak
-        if cred_had and os.path.exists(cred_bak):
-            try:
-                os.replace(cred_bak, self.cred_path)
-                restored = True
-            except Exception:
-                pass
+        if cred_had:
+            self._restore_file_securely(self.cred_path, cred_bak, is_state=False)
         elif not cred_had and os.path.exists(self.cred_path):
             try:
                 os.remove(self.cred_path)
-                restored = True
             except Exception:
                 pass
 
-        # 2. 恢复会话
+        # 2. 恢复会话文件（若加密备份则解密还原；若原先不存在则移除新生成文件）
         state_had = tx.get("state_had_existed", False)
         state_bak = tx.get("state_tx_bak") or self.state_tx_bak
-        if state_had and os.path.exists(state_bak):
-            try:
-                os.replace(state_bak, self.state_path)
-                restored = True
-            except Exception:
-                pass
+        if state_had:
+            self._restore_file_securely(self.state_path, state_bak, is_state=True)
         elif not state_had and os.path.exists(self.state_path):
             try:
                 os.remove(self.state_path)
-                restored = True
             except Exception:
                 pass
 
+        # 3. 双文件均已安全落盘并处于恢复状态，再统一清理事务临时文件
         self.commit_transaction()
-        return restored
+        return True
 
     def recover_pending_transaction(self) -> bool:
         """

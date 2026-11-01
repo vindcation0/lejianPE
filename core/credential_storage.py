@@ -90,6 +90,48 @@ def dpapi_unprotect(ciphertext: bytes) -> bytes:
     return plain
 
 
+def secure_file_permissions(file_path: str) -> None:
+    """
+    对敏感凭据、Token、会话文件及其事务备份设置显式访问控制权限 (DACL / chmod)。
+    - POSIX 系统：设置 0o600 权限（仅当前用户拥有读写权限）。
+    - Windows 系统：通过 icacls 移除继承权限 (/inheritance:r)，显式授予当前用户 (%USERNAME%)、
+      SYSTEM 与 Administrators 完全控制权限，拒绝其他普通本地用户访问。
+    """
+    if not os.path.exists(file_path):
+        return
+
+    if is_windows():
+        username = os.getenv("USERNAME")
+        if username:
+            try:
+                import subprocess
+                cmd = [
+                    "icacls",
+                    os.path.abspath(file_path),
+                    "/inheritance:r",
+                    "/grant:r",
+                    f"{username}:(F)",
+                    "/grant:r",
+                    "SYSTEM:(F)",
+                    "/grant:r",
+                    "Administrators:(F)",
+                ]
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                pass
+    else:
+        try:
+            os.chmod(file_path, 0o600)
+        except OSError:
+            pass
+
+
 def mask_account(acc: Optional[str]) -> str:
     """脱敏手机号或账号：保留前 3 位和后 4 位"""
     s = str(acc or "").strip()
@@ -222,13 +264,20 @@ class CredentialStorage:
         if os.path.exists(self.cred_path):
             try:
                 shutil.copy2(self.cred_path, bak_path)
+                secure_file_permissions(bak_path)
             except Exception as e:
                 raise CredentialError(f"备份原有凭据失败: {e}。为防止数据丢失，已拒绝保存！原有凭据未被修改。") from e
 
         try:
-            # 1. 写入临时文件
+            # 1. 写入临时文件并落盘
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            secure_file_permissions(tmp_path)
 
             # 2. 严格回读验证
             with open(tmp_path, "r", encoding="utf-8") as f:
@@ -250,6 +299,7 @@ class CredentialStorage:
 
             # 3. 校验完全通过，原子替换
             os.replace(tmp_path, self.cred_path)
+            secure_file_permissions(self.cred_path)
         except Exception as e:
             # 异常时清理临时文件，确保旧文件完好
             if os.path.exists(tmp_path):

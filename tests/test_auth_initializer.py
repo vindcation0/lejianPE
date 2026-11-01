@@ -1,7 +1,7 @@
 """
-乐健体育 · 认证重新初始化统一流程自动化测试套件 (I01 ~ I18)。
+乐健体育 · 认证重新初始化统一流程自动化测试套件 (I01 ~ I20)。
 ==============================================================
-覆盖执行计划 M2 (第二阶段) 全部验收指标及事务增强：
+覆盖执行计划 M2 (第二阶段) 全部验收指标及事务与权限加固：
 1. 本地状态检查与脱敏报告 (check_status)
 2. 抓包流量文件凭据提取与异常解析 (extract_from_flows)
 3. 凭据合法性校验 (verify_new_credential)
@@ -20,6 +20,8 @@
 16. lejian.py reinit 与 menu.py 统一入口路由协同
 17. 跨文件复合事务保护：凭据替换成功后 state.json 更新失败，自动回滚恢复旧凭据与旧会话 (I17)
 18. 未决事务开机自检与自动恢复机制 (I18)
+19. state.json 备份 DPAPI 密文包装与显式 DACL 权限加固 (I19)
+20. 事务回滚幂等性与抗二次断电中断自愈 (I20)
 """
 import io
 import json
@@ -505,6 +507,105 @@ class AuthInitializerTestSuite(unittest.TestCase):
         # 4. 验证事务记录已清理
         self.assertFalse(os.path.exists(self.initializer.tx_path))
         self.assertFalse(os.path.exists(self.initializer.cred_tx_bak))
+
+    # ==================== I19: state.json 备份 DPAPI 密文包装与 DACL 权限加固 ====================
+    def test_I19_state_backup_encryption_and_dacl_permissions(self):
+        """I19: 验证 state.json 包含明文 Token 时，事务备份采用 DPAPI 密文保护且设置显式 DACL 权限"""
+        sensitive_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.SecretTokenPayload"
+        state_data = {
+            "accessToken": sensitive_token,
+            "refreshToken": "ref_sensitive_token_999",
+            "schoolId": "sch_123",
+            "semesterId": "sem_123",
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(state_data, f)
+
+        # 启动事务备份（启用 DPAPI 模式）
+        init_dpapi = AuthInitializer(
+            cred_path=self.cred_path,
+            state_path=self.state_path,
+            use_dpapi=True,
+        )
+
+        from core.credential_storage import is_windows
+        if is_windows():
+            # 在 Windows 环境下，直接测试 DPAPI 密文包装
+            ok = init_dpapi._backup_file_securely(self.state_path, init_dpapi.state_tx_bak, is_state=True)
+            self.assertTrue(ok)
+            self.assertTrue(os.path.exists(init_dpapi.state_tx_bak))
+
+            # 读取备份文件，确认磁盘上绝无明文敏感 Token！
+            with open(init_dpapi.state_tx_bak, "r", encoding="utf-8") as f:
+                bak_content = f.read()
+            self.assertNotIn(sensitive_token, bak_content, "state.json 事务备份意外裸露明文 Token！")
+            self.assertIn("DPAPI_PROTECTED_STATE_BACKUP", bak_content)
+
+            # 验证解密还原一致性
+            restored_path = os.path.join(self.test_dir, "state_restored.json")
+            res_ok = init_dpapi._restore_file_securely(restored_path, init_dpapi.state_tx_bak, is_state=True)
+            self.assertTrue(res_ok)
+            with open(restored_path, "r", encoding="utf-8") as f:
+                restored_json = json.load(f)
+            self.assertEqual(restored_json["accessToken"], sensitive_token)
+        else:
+            # 在非 Windows 环境下，验证权限加固 (0o600)
+            ok = init_dpapi._backup_file_securely(self.state_path, init_dpapi.state_tx_bak, is_state=True)
+            self.assertTrue(ok)
+            mode = oct(os.stat(init_dpapi.state_tx_bak).st_mode & 0o777)
+            self.assertEqual(mode, "0o600")
+
+    # ==================== I20: 回滚幂等性与抗二次断电自愈验证 ====================
+    def test_I20_idempotent_rollback_and_interrupted_recovery(self):
+        """I20: 验证重复执行 rollback 具备绝对幂等性，且恢复过程中断电能在下次开机继续自愈"""
+        # 1. 预设旧凭据和旧会话
+        self.initializer.storage.save_credential("13800138000", "sig_idempotent_1", use_dpapi=False)
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump({"accessToken": "tok_idem_1", "schoolId": "s", "semesterId": "m"}, f)
+
+        # 开启事务
+        self.initializer.begin_transaction()
+        self.initializer.record_tx_step("CRED_APPLIED")
+
+        # 2. 第一次执行回滚
+        ok1 = self.initializer.rollback_transaction()
+        self.assertTrue(ok1)
+
+        # 3. 再次重复执行回滚（验证幂等性）
+        ok2 = self.initializer.rollback_transaction()
+        self.assertFalse(ok2, "已清理的事务再次回滚应当优雅返回 False，严禁抛出异常")
+
+        # 4. 模拟恢复阶段中途断电：凭据已恢复但事务日志和 state 备份仍在
+        fake_tx = {
+            "tx_id": "tx_mid_recovery_crash",
+            "status": "CRED_APPLIED",
+            "cred_path": self.cred_path,
+            "cred_had_existed": True,
+            "cred_tx_bak": self.initializer.cred_tx_bak,
+            "state_path": self.state_path,
+            "state_had_existed": True,
+            "state_tx_bak": self.initializer.state_tx_bak,
+        }
+        # 凭据已经恢复成正确旧凭据
+        self.initializer.storage.save_credential("13800138000", "sig_idempotent_1", use_dpapi=False)
+        # 会话此时仍处于异常新值
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump({"accessToken": "tok_bad_broken_session"}, f)
+        # 会话备份文件存着旧会话
+        with open(self.initializer.state_tx_bak, "w", encoding="utf-8") as f:
+            json.dump({"accessToken": "tok_idem_1", "schoolId": "s", "semesterId": "m"}, f)
+        with open(self.initializer.tx_path, "w", encoding="utf-8") as f:
+            json.dump(fake_tx, f)
+
+        # 下次启动调用自检，验证继续自愈
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            self.initializer.recover_pending_transaction()
+
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            recovered_state = json.load(f)
+        self.assertEqual(recovered_state["accessToken"], "tok_idem_1", "中断后二次自愈未能恢复旧会话！")
+        self.assertFalse(os.path.exists(self.initializer.tx_path))
 
 
 if __name__ == "__main__":
