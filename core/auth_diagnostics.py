@@ -3,10 +3,13 @@
 ======================================================
 职责：
 1. 捕获认证全生命周期异常，将其结构化归一化为标准的 AuthDiagnosticReport。
-2. 覆盖所有典型场景：签名失效(50004)、密码错误、Token 过期、网络异常、服务端5xx、
-   请求参数错误/限流、AES解密失败、响应结构异常、凭据损坏、DPAPI限制以及未知兜底。
+2. 覆盖所有典型场景：签名失效(50004)、密码错误、登录401与业务401区分、Token 过期、
+   网络异常、服务端5xx、请求限流(429)独立处理、AES解密失败、响应结构异常、凭据损坏、
+   DPAPI平台限制与解密失败区分、未知错误兜底。
 3. 严格安全脱敏：严禁泄露明文密码、完整 Token、完整 signDigital 及 AES 密钥。
-4. 绝不因错误诊断而向服务端发送额外的重复网络登录请求。
+4. 严格 Fail-closed 凭据安全：绝不自动降级或建议降级为明文存储。
+5. 针对 429 限流提取 Retry-After 并采用保守等待策略，严禁自动连续重试。
+6. 未知错误默认不推荐重新初始化，优先展示脱敏诊断报告供排查。
 """
 import datetime
 import os
@@ -37,30 +40,36 @@ class ErrorCategory:
     """认证错误标准分类枚举/常量"""
     SIGNATURE_ERROR = "SIGNATURE_ERROR"              # 业务码 50004 签名错误
     WRONG_PASSWORD = "WRONG_PASSWORD"                # 密码或账号错误
-    TOKEN_EXPIRED = "TOKEN_EXPIRED"                  # Token 过期或 401
+    UNAUTHORIZED = "UNAUTHORIZED"                    # 登录接口 HTTP 401 凭据无效或未授权
+    TOKEN_EXPIRED = "TOKEN_EXPIRED"                  # 业务接口 HTTP 401 访问令牌过期或作废
     REFRESH_TOKEN_EXPIRED = "REFRESH_TOKEN_EXPIRED"  # 刷新凭据失效
+    RATE_LIMITED = "RATE_LIMITED"                    # HTTP 429 服务端限流
     NETWORK_ERROR = "NETWORK_ERROR"                  # 网络/DNS/连接超时
     SERVER_ERROR = "SERVER_ERROR"                    # HTTP 5xx 故障
-    CLIENT_PARAM_ERROR = "CLIENT_PARAM_ERROR"        # HTTP 4xx 或限流 429
+    CLIENT_PARAM_ERROR = "CLIENT_PARAM_ERROR"        # HTTP 4xx 请求参数错误或拒绝 (非 401/429)
     DECRYPT_FAILED = "DECRYPT_FAILED"                # AES 信封解密失败
     MALFORMED_RESPONSE = "MALFORMED_RESPONSE"        # 响应缺少必要字段
     CREDENTIAL_CORRUPTED = "CREDENTIAL_CORRUPTED"    # 本地凭据损坏或缺失
-    DPAPI_UNAVAILABLE = "DPAPI_UNAVAILABLE"          # DPAPI 平台限制或解密失败
+    DPAPI_UNAVAILABLE = "DPAPI_UNAVAILABLE"          # 平台不支持 Windows DPAPI 凭据安全机制
+    DPAPI_DECRYPT_FAILED = "DPAPI_DECRYPT_FAILED"    # Windows DPAPI 凭据解密失败 (跨用户/密文损坏)
     UNKNOWN_ERROR = "UNKNOWN_ERROR"                  # 未知错误兜底
 
 
 CATEGORY_NAMES = {
     ErrorCategory.SIGNATURE_ERROR: "认证签名错误 (50004)",
     ErrorCategory.WRONG_PASSWORD: "账号或密码错误",
-    ErrorCategory.TOKEN_EXPIRED: "登录会话已过期 (Token Expired)",
+    ErrorCategory.UNAUTHORIZED: "登录凭据无效或未授权 (HTTP 401)",
+    ErrorCategory.TOKEN_EXPIRED: "业务会话已过期 (Token Expired, HTTP 401)",
     ErrorCategory.REFRESH_TOKEN_EXPIRED: "会话刷新凭据失效 (RefreshToken Expired)",
+    ErrorCategory.RATE_LIMITED: "服务端请求限流 (HTTP 429)",
     ErrorCategory.NETWORK_ERROR: "网络连接通信异常",
     ErrorCategory.SERVER_ERROR: "服务端故障 (HTTP 5xx)",
-    ErrorCategory.CLIENT_PARAM_ERROR: "请求参数错误或访问受限",
+    ErrorCategory.CLIENT_PARAM_ERROR: "请求参数错误或访问受限 (HTTP 4xx)",
     ErrorCategory.DECRYPT_FAILED: "登录信封解密失败",
     ErrorCategory.MALFORMED_RESPONSE: "服务端响应数据结构异常",
     ErrorCategory.CREDENTIAL_CORRUPTED: "本地认证凭据异常",
-    ErrorCategory.DPAPI_UNAVAILABLE: "Windows DPAPI 凭据保护异常",
+    ErrorCategory.DPAPI_UNAVAILABLE: "平台不支持 Windows DPAPI 凭据安全机制",
+    ErrorCategory.DPAPI_DECRYPT_FAILED: "Windows DPAPI 凭据解密失败",
     ErrorCategory.UNKNOWN_ERROR: "未分类未知异常",
 }
 
@@ -84,7 +93,7 @@ def mask_sensitive_text(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 2. 屏蔽 signDigital / 签名相关长字符串 (>= 32 字符的 hex 或 base64)
+    # 2. 屏蔽 signDigital / 签名相关长字符串 (>= 20 字符的 hex 或 base64)
     s = re.sub(
         r"(signDigital[\"':\s=]+)([a-zA-Z0-9_\+/=]{20,})",
         r"\1[MASKED_SIGNATURE]",
@@ -135,6 +144,7 @@ class AuthDiagnosticReport:
         account_masked: Optional[str] = None,
         can_reinit: bool = False,
         can_retry: bool = False,
+        retry_after: Optional[int] = None,
         raw_message_masked: str = "",
     ):
         self.diagnostic_id = diagnostic_id
@@ -149,6 +159,7 @@ class AuthDiagnosticReport:
         self.account_masked = account_masked
         self.can_reinit = can_reinit
         self.can_retry = can_retry
+        self.retry_after = retry_after
         self.raw_message_masked = raw_message_masked
 
     def to_dict(self) -> Dict[str, Any]:
@@ -166,6 +177,7 @@ class AuthDiagnosticReport:
             "suggested_actions": self.suggested_actions,
             "can_reinit": self.can_reinit,
             "can_retry": self.can_retry,
+            "retry_after": self.retry_after,
             "raw_message_masked": self.raw_message_masked,
         }
 
@@ -192,6 +204,8 @@ class AuthDiagnosticReport:
             code_parts.append(f"业务代码 {self.business_code}")
         if self.http_status is not None and self.http_status != -1:
             code_parts.append(f"HTTP {self.http_status}")
+        if self.retry_after is not None:
+            code_parts.append(f"Retry-After {self.retry_after}s")
         if code_parts:
             lines.append(f"服务端响应代码：{', '.join(code_parts)}")
 
@@ -220,7 +234,6 @@ class AuthDiagnosticReport:
 def _generate_diag_id() -> str:
     """生成带时间戳和短哈希的唯一诊断编号"""
     t_str = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    # 生成 4 位短随机标识
     short_hash = f"{int(time.time() * 1000) % 10000:04d}"
     return f"DIAG-AUTH-{t_str}-{short_hash}"
 
@@ -234,6 +247,10 @@ def diagnose_auth_error(
     安全保证：
     - 不会发送任何网络请求。
     - 绝不记录或返回明文敏感凭据。
+    - 严格遵循 Fail-closed 安全策略，禁止降级明文存储。
+    - 区分登录 401 与业务 401。
+    - 429 独立处理并提取 Retry-After，禁止连续重试。
+    - 未知错误严格不推荐重新初始化，优先展示脱敏报告供排查。
     """
     ctx = context or {}
     account = ctx.get("account")
@@ -253,19 +270,22 @@ def diagnose_auth_error(
     if hasattr(exc, "code"):
         business_code = getattr(exc, "code")
 
-    # 1. 优先识别本地凭据损坏、缺失或 DPAPI 异常 (CredentialError / InvalidCredentialError)
+    # =========================================================================
+    # 1. 本地凭据异常 (CredentialError / InvalidCredentialError)
+    # =========================================================================
     if isinstance(exc, (CredentialError, InvalidCredentialError)):
-        if "dpapi" in raw_msg.lower() or "crypt" in raw_msg.lower():
+        # 1.1 平台不支持 Windows DPAPI 凭据安全机制
+        if "非 windows" in raw_msg.lower() or "notimplementederror" in raw_msg.lower() or "仅在 windows" in raw_msg:
             category = ErrorCategory.DPAPI_UNAVAILABLE
-            summary = "Windows DPAPI 凭据安全加解密服务异常。"
+            summary = "当前操作系统平台不支持 Windows DPAPI 凭据安全加密体系。"
             causes = [
-                "当前凭据由其他 Windows 用户账号加密创建，当前用户无权限解密。",
-                "当前运行平台不是 Windows 系统，无法调用 Windows 原生 DPAPI 接口。",
-                "credential.json 中的 DPAPI 密文数据已损坏。",
+                "当前运行环境非 Windows，系统缺少原生 DPAPI (CryptProtectData) 安全隔离机制。",
+                "系统遵循 Fail-closed 安全屏障，严禁在不支持 DPAPI 的环境自动降级为明文存储凭据。",
             ]
             actions = [
-                "请重新执行认证初始化以使用当前用户权限生成凭据（主菜单 [b]）。",
-                "非 Windows 环境下请使用明文模式初始化凭据。",
+                "请在受信任的 Windows 环境下运行以保证凭据加密存储安全。",
+                "严格禁止降级为明文凭据保存，防止敏感认证材料外泄。",
+                "若需在非 Windows 平台部署，应配置跨平台安全凭据隔离方案（如 Keyring/安全密钥库）。",
             ]
             return AuthDiagnosticReport(
                 diagnostic_id=diag_id,
@@ -278,38 +298,70 @@ def diagnose_auth_error(
                 http_status=http_status,
                 business_code=business_code,
                 account_masked=account_masked,
-                can_reinit=True,
-                can_retry=False,
-                raw_message_masked=raw_msg,
-            )
-        else:
-            category = ErrorCategory.CREDENTIAL_CORRUPTED
-            summary = "本地认证凭据 (credential.json) 缺失、损坏或内容不完整。"
-            causes = [
-                "首次使用，尚未生成本地 credential.json 凭据文件。",
-                "credential.json 格式损坏（非标准 JSON）或必要字段缺失（缺少 signDigital 或账号）。",
-            ]
-            actions = [
-                "请执行认证凭据初始化：在菜单中选择 [b] 重新抓取登录签名。",
-                "或根据官方抓包指引重新生成 credential.json。",
-            ]
-            return AuthDiagnosticReport(
-                diagnostic_id=diag_id,
-                timestamp=now_str,
-                error_category=category,
-                category_name=CATEGORY_NAMES[category],
-                summary=summary,
-                possible_causes=causes,
-                suggested_actions=actions,
-                http_status=http_status,
-                business_code=business_code,
-                account_masked=account_masked,
-                can_reinit=True,
+                can_reinit=False,  # 非 Windows 下重抓也无法调用 DPAPI，先明确系统限制
                 can_retry=False,
                 raw_message_masked=raw_msg,
             )
 
-    # 2. 签名错误识别：业务码 50004 或包含 "签名" (在线服务端认证)
+        # 1.2 Windows DPAPI 解密失败 (跨用户/密文损坏/主密钥失效)
+        if ("dpapi" in raw_msg.lower() or "crypt" in raw_msg.lower() or "无权访问" in raw_msg) and ("解密" in raw_msg or "失败" in raw_msg):
+            category = ErrorCategory.DPAPI_DECRYPT_FAILED
+            summary = "Windows DPAPI 凭据解密失败（Fail-closed 拒绝采用不可信或无权数据）。"
+            causes = [
+                "当前 credential.json 是由其他 Windows 用户账号加密创建，当前用户无权限解密。",
+                "本地凭据中的 DPAPI 密文字段已损坏或遭篡改。",
+                "操作系统用户登录密码近期发生重置，导致 DPAPI 主解密密钥失效。",
+            ]
+            actions = [
+                "请在当前 Windows 登录用户下重新执行认证初始化（主菜单 [b]），重新生成属于当前账户的加密凭据。",
+                "系统已执行 Fail-closed 保护，原凭据完好无损，未发生破坏或覆盖。",
+            ]
+            return AuthDiagnosticReport(
+                diagnostic_id=diag_id,
+                timestamp=now_str,
+                error_category=category,
+                category_name=CATEGORY_NAMES[category],
+                summary=summary,
+                possible_causes=causes,
+                suggested_actions=actions,
+                http_status=http_status,
+                business_code=business_code,
+                account_masked=account_masked,
+                can_reinit=True,  # 允许在当前账户下一键重新初始化生成专属凭据
+                can_retry=False,
+                raw_message_masked=raw_msg,
+            )
+
+        # 1.3 本地凭据损坏或缺失 (credential.json 格式或字段异常)
+        category = ErrorCategory.CREDENTIAL_CORRUPTED
+        summary = "本地认证凭据 (credential.json) 缺失、损坏或内容不完整。"
+        causes = [
+            "首次使用，尚未生成本地 credential.json 凭据文件。",
+            "credential.json 格式损坏（非标准 JSON）或必要字段缺失（缺少 signDigital 或账号）。",
+        ]
+        actions = [
+            "请执行认证凭据初始化：在菜单中选择 [b] 重新抓取登录签名。",
+            "或根据官方抓包指引重新生成 credential.json。",
+        ]
+        return AuthDiagnosticReport(
+            diagnostic_id=diag_id,
+            timestamp=now_str,
+            error_category=category,
+            category_name=CATEGORY_NAMES[category],
+            summary=summary,
+            possible_causes=causes,
+            suggested_actions=actions,
+            http_status=http_status,
+            business_code=business_code,
+            account_masked=account_masked,
+            can_reinit=True,  # 推荐重新初始化
+            can_retry=False,
+            raw_message_masked=raw_msg,
+        )
+
+    # =========================================================================
+    # 2. 签名错误识别：业务码 50004 (在线服务端认证)
+    # =========================================================================
     if (business_code == 50004) or ("50004" in raw_msg) or ("签名" in raw_msg and isinstance(exc, (BusinessAuthError, AuthError))):
         category = ErrorCategory.SIGNATURE_ERROR
         summary = "服务端拒绝认证请求：客户端提供的登录签名 (signDigital) 校验失败。"
@@ -333,12 +385,14 @@ def diagnose_auth_error(
             http_status=http_status or 200,
             business_code=business_code if business_code is not None else 50004,
             account_masked=account_masked,
-            can_reinit=True,
+            can_reinit=True,  # 推荐重新初始化
             can_retry=False,
             raw_message_masked=raw_msg,
         )
 
+    # =========================================================================
     # 3. 密码或账号错误识别
+    # =========================================================================
     is_wrong_pwd = False
     if isinstance(exc, BusinessAuthError):
         if ("密码" in raw_msg or "账号" in raw_msg or "用户" in raw_msg) and "签名" not in raw_msg:
@@ -370,22 +424,54 @@ def diagnose_auth_error(
             http_status=http_status or 200,
             business_code=business_code,
             account_masked=account_masked,
-            can_reinit=False,
+            can_reinit=False,  # 严禁引导重新抓取签名
             can_retry=True,
             raw_message_masked=raw_msg,
         )
 
-    # 3. 会话过期与 401 识别 (Token Expired)
-    if http_status == 401 or ("401" in raw_msg and "未授权" in raw_msg) or ("Token" in raw_msg and ("过期" in raw_msg or "失效" in raw_msg)):
-        category = ErrorCategory.TOKEN_EXPIRED
-        summary = "当前登录会话已过期或已被服务端作废 (HTTP 401)。"
+    # =========================================================================
+    # 4. HTTP 429 请求限流信号 (独立分类，保守等待，严禁连续重试)
+    # =========================================================================
+    if http_status == 429 or "429" in raw_msg or "too many requests" in raw_msg.lower():
+        category = ErrorCategory.RATE_LIMITED
+
+        # 尝试提取 Retry-After
+        retry_after_val: Optional[int] = None
+        if ctx.get("retry_after"):
+            try:
+                retry_after_val = int(ctx.get("retry_after"))
+            except Exception:
+                pass
+        elif ctx.get("headers"):
+            hdrs = ctx.get("headers", {})
+            val = hdrs.get("Retry-After") or hdrs.get("retry-after")
+            if val:
+                try:
+                    retry_after_val = int(val)
+                except Exception:
+                    pass
+        if retry_after_val is None:
+            m = re.search(r"retry-after[:\s]+(\d+)", raw_msg, re.IGNORECASE)
+            if m:
+                try:
+                    retry_after_val = int(m.group(1))
+                except Exception:
+                    pass
+
+        if retry_after_val is not None and retry_after_val > 0:
+            summary = f"服务端触发频控限流保护 (HTTP 429)，服务端指示冷却等待 {retry_after_val} 秒。"
+            wait_action = f"服务端返回了 Retry-After，请严格暂停所有请求并等待 {retry_after_val} 秒后再试。"
+        else:
+            summary = "服务端触发频控限流保护 (HTTP 429)，当前请求频次超出防刷阈值。"
+            wait_action = "服务端未提供 Retry-After 标头，系统采用保守冷却策略，请暂停操作至少 60~180 秒后再试。"
+
         causes = [
-            "距离上次登录已超过 Token 有效期（通常为数小时至数天）。",
-            "在其他设备或官方客户端重复登录导致原 Token 被顶下线。",
+            "在短时间内发起了过多登录或接口请求，触发了服务端的防刷安全拦截。",
+            "当前网络出口 IP 处于服务端访问频次限制窗口期内。",
         ]
         actions = [
-            "执行命令行账号密码登录（主菜单 [9]），重新获取新的 Token。",
-            "或尝试通过主菜单 [8] 强制刷新 Token。",
+            wait_action,
+            "严禁自动连续重试或高频刷新，以免 IP 遭到更长时间的封锁惩罚。",
         ]
         return AuthDiagnosticReport(
             diagnostic_id=diag_id,
@@ -395,16 +481,94 @@ def diagnose_auth_error(
             summary=summary,
             possible_causes=causes,
             suggested_actions=actions,
-            http_status=401,
+            http_status=429,
             business_code=business_code,
             account_masked=account_masked,
-            can_reinit=False,
-            can_retry=True,
+            can_reinit=False,  # 限流不是签名问题，不重新初始化
+            can_retry=False,   # 严禁自动重试
+            retry_after=retry_after_val,
             raw_message_masked=raw_msg,
         )
 
-    # 4. RefreshToken 失效识别
-    if "refreshToken" in raw_msg.lower() or ("刷新" in raw_msg and ("失效" in raw_msg or "过期" in raw_msg)):
+    # =========================================================================
+    # 5. HTTP 401 细粒度区分：登录接口 401 vs 业务接口 401 (Token Expired)
+    # =========================================================================
+    is_401 = False
+    if http_status == 401:
+        is_401 = True
+    elif isinstance(exc, AuthNetworkError) and exc.http_status == 401:
+        is_401 = True
+    elif "401" in raw_msg and ("未授权" in raw_msg or "unauthorized" in raw_msg.lower()):
+        is_401 = True
+
+    if is_401:
+        is_login_endpoint = (
+            stage == "login"
+            or "manage/login" in raw_msg.lower()
+            or "login" in str(ctx.get("path", "")).lower()
+        )
+
+        if is_login_endpoint:
+            # 5.1 登录接口 401：凭据无效、未激活、无权限
+            category = ErrorCategory.UNAUTHORIZED
+            summary = "登录接口返回 HTTP 401 未授权：账号登录凭据未通过服务端核验。"
+            causes = [
+                "提交的登录认证材料已被服务端判定无效或撤销。",
+                "账号状态异常（例如账号被冻结、尚未激活或未在学校系统完成注册）。",
+                "登录入口 (entrance) 或认证通道无权访问该接口。",
+            ]
+            actions = [
+                "请先在乐健体育官方 App 验证账号是否能正常登录并查看账号状态。",
+                "核对账号在教务学籍系统的开通情况后再尝试登录。",
+                "请勿连续高频发起登录请求。",
+            ]
+            return AuthDiagnosticReport(
+                diagnostic_id=diag_id,
+                timestamp=now_str,
+                error_category=category,
+                category_name=CATEGORY_NAMES[category],
+                summary=summary,
+                possible_causes=causes,
+                suggested_actions=actions,
+                http_status=401,
+                business_code=business_code,
+                account_masked=account_masked,
+                can_reinit=False,  # 先检查账号状态，不盲目重抓
+                can_retry=False,
+                raw_message_masked=raw_msg,
+            )
+        else:
+            # 5.2 业务接口 401：访问令牌过期或被注销
+            category = ErrorCategory.TOKEN_EXPIRED
+            summary = "业务接口返回 HTTP 401 未授权：当前访问令牌 (AccessToken) 已过期或已被作废。"
+            causes = [
+                "距离上次登录已超过 AccessToken 有效期（通常为数小时至数天）。",
+                "在其他设备或官方客户端重复登录导致原 Token 被顶下线或撤回。",
+            ]
+            actions = [
+                "执行命令行账号密码登录（主菜单 [9]），重新获取新的 Token。",
+                "或尝试通过主菜单 [8] 刷新 Token。",
+            ]
+            return AuthDiagnosticReport(
+                diagnostic_id=diag_id,
+                timestamp=now_str,
+                error_category=category,
+                category_name=CATEGORY_NAMES[category],
+                summary=summary,
+                possible_causes=causes,
+                suggested_actions=actions,
+                http_status=401,
+                business_code=business_code,
+                account_masked=account_masked,
+                can_reinit=False,
+                can_retry=True,
+                raw_message_masked=raw_msg,
+            )
+
+    # =========================================================================
+    # 6. 会话 RefreshToken 失效识别
+    # =========================================================================
+    if "refreshtoken" in raw_msg.lower() or ("刷新" in raw_msg and ("失效" in raw_msg or "过期" in raw_msg)):
         category = ErrorCategory.REFRESH_TOKEN_EXPIRED
         summary = "长期刷新凭据 (RefreshToken) 已失效，无法自动刷新会话。"
         causes = [
@@ -430,7 +594,9 @@ def diagnose_auth_error(
             raw_message_masked=raw_msg,
         )
 
-    # 5. 服务端故障 HTTP 5xx 识别
+    # =========================================================================
+    # 7. 服务端故障 HTTP 5xx 识别
+    # =========================================================================
     is_5xx = False
     if http_status and http_status >= 500:
         is_5xx = True
@@ -460,24 +626,17 @@ def diagnose_auth_error(
             http_status=status_num,
             business_code=business_code,
             account_masked=account_masked,
-            can_reinit=False,
+            can_reinit=False,  # 服务端故障严禁引导重抓签名
             can_retry=True,
             raw_message_masked=raw_msg,
         )
 
-    # 6. 请求限制与客户端参数错误 (HTTP 4xx / HTTP 429)
-    if (http_status and 400 <= http_status < 500) or ("429" in raw_msg) or ("403" in raw_msg):
+    # =========================================================================
+    # 8. 请求参数错误或受限 (HTTP 4xx 非 401/429)
+    # =========================================================================
+    if (http_status and 400 <= http_status < 500) or ("403" in raw_msg):
         category = ErrorCategory.CLIENT_PARAM_ERROR
-        if http_status == 429 or "429" in raw_msg:
-            summary = "登录请求过于频繁，触发服务端限流保护 (HTTP 429)。"
-            causes = [
-                "在短时间内多次发起登录或网络探测请求。",
-                "当前 IP 地址请求频次超出服务端限制阈值。",
-            ]
-            actions = [
-                "请暂停操作，等待 1~3 分钟后再试。",
-            ]
-        elif http_status == 403 or "403" in raw_msg:
+        if http_status == 403 or "403" in raw_msg:
             summary = "服务端拒绝访问：权限不足或 IP 受到策略限制 (HTTP 403)。"
             causes = [
                 "请求遭到安全网关或 WAF 拦截。",
@@ -507,11 +666,13 @@ def diagnose_auth_error(
             business_code=business_code,
             account_masked=account_masked,
             can_reinit=False,
-            can_retry=True,
+            can_retry=False,
             raw_message_masked=raw_msg,
         )
 
-    # 7. 网络连接与通信异常 (DNS 失败、超时、断网等)
+    # =========================================================================
+    # 9. 网络连接通信异常 (DNS 失败、超时、断网等)
+    # =========================================================================
     is_network = False
     if isinstance(exc, AuthNetworkError) and not is_5xx:
         is_network = True
@@ -542,12 +703,14 @@ def diagnose_auth_error(
             http_status=http_status,
             business_code=business_code,
             account_masked=account_masked,
-            can_reinit=False,
+            can_reinit=False,  # 网络故障严禁引导重抓签名
             can_retry=True,
             raw_message_masked=raw_msg,
         )
 
-    # 8. 解密失败 (AES 登录信封解密异常)
+    # =========================================================================
+    # 10. 解密失败 (AES 登录信封解密异常)
+    # =========================================================================
     if "解密" in raw_msg and ("信封" in raw_msg or "载荷" in raw_msg or "pyd" in raw_msg or "aes" in raw_msg.lower()):
         category = ErrorCategory.DECRYPT_FAILED
         summary = "服务端返回的加密载荷 (AES pyd) 解密失败。"
@@ -576,7 +739,9 @@ def diagnose_auth_error(
             raw_message_masked=raw_msg,
         )
 
-    # 9. 响应缺少必要字段 / 结构异常
+    # =========================================================================
+    # 11. 响应缺少必要字段 / 结构异常
+    # =========================================================================
     if isinstance(exc, (TokenAcquisitionError, SchoolInfoError, SemesterInfoError)) or ("缺少" in raw_msg and ("token" in raw_msg.lower() or "schoolid" in raw_msg.lower() or "data" in raw_msg.lower())):
         category = ErrorCategory.MALFORMED_RESPONSE
         summary = "服务端响应格式非法或缺失必要字段（如 Token 或学校标识）。"
@@ -605,17 +770,19 @@ def diagnose_auth_error(
             raw_message_masked=raw_msg,
         )
 
-    # 10. 未知错误安全兜底 (UNKNOWN_ERROR)
+    # =========================================================================
+    # 12. 未知错误安全兜底 (UNKNOWN_ERROR) - 严格不建议重新初始化，先诊断！
+    # =========================================================================
     category = ErrorCategory.UNKNOWN_ERROR
     summary = "登录过程遇到未分类的未知异常。"
     causes = [
         "服务端返回了未收录的非标准响应或业务代码。",
         "运行时遭遇未预期的系统或环境异常。",
-        "原因尚未完全确定，请结合脱敏诊断详情进行排查。",
+        "原因尚未完全确定，请优先查看下方脱敏诊断详情进行排查，切勿盲目重新初始化认证。",
     ]
     actions = [
-        "请查看脱敏诊断详情了解底层异常提示。",
-        "可尝试重新登录或重新初始化凭据。",
+        "查看脱敏诊断详情了解底层异常提示。",
+        "确认服务端状态及网络环境，避免盲目重抓签名。",
         "若问题依然存在，请将诊断报告反馈给维护者。",
     ]
     return AuthDiagnosticReport(
@@ -629,8 +796,8 @@ def diagnose_auth_error(
         http_status=http_status,
         business_code=business_code,
         account_masked=account_masked,
-        can_reinit=True,
-        can_retry=True,
+        can_reinit=False,  # 严格按用户要求设为 False！先诊断，不建议重初始化
+        can_retry=False,
         raw_message_masked=raw_msg,
     )
 
@@ -662,9 +829,12 @@ def handle_login_failure(
         if report.can_reinit:
             print("  [1] 是，开始重新初始化认证凭据")
             print("  [2] 否，返回主菜单/退出")
-        else:
+        elif report.can_retry:
             print("  [1] 重新尝试登录")
             print("  [2] 返回主菜单/退出")
+        else:
+            print("  [1] 退出并稍后排查")
+            print("  [2] 返回主菜单")
         print("  [3] 查看详细诊断信息（已脱敏）")
 
         try:
@@ -680,10 +850,15 @@ def handle_login_failure(
                 else:
                     print("\n提示：当前一键初始化功能可通过菜单 [b] 重新抓取签名，")
                     print("或运行：python tools\\capture_login.py")
-            else:
+            elif report.can_retry:
                 print("\n请返回主菜单后重新尝试登录。")
+            else:
+                if report.error_category == ErrorCategory.RATE_LIMITED:
+                    print("\n[注意] 当前处于服务端限流状态，请严格遵循冷却时间等待，切勿连续发起请求。")
+                else:
+                    print("\n已记录当前诊断编号，请排查原因后再试。")
             break
-        elif choice == "2" or choice == "q" or choice == "0":
+        elif choice in ("2", "q", "0"):
             break
         elif choice == "3":
             print("\n" + report.format_report(verbose=True))
