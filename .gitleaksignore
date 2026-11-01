@@ -7,3 +7,4 @@ ce2aaa6fb93a760fccb6084f0a09594eb59993c8:tools/login_envelope.py:generic-api-key
 
 # 2. 单测脱敏测试虚拟占位字符串 (历史提交单测数据)
 a1cbceb7163efafcccdb239eb1e3051f4364e88f:tests/test_auth.py:generic-api-key:650
+a5687484e604d5bdff0cc814fab7c0b9796f6952:tests/test_auth_initializer.py:generic-api-key:363
