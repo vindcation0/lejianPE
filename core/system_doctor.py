@@ -1,14 +1,21 @@
 """
-乐健体育 · 独立系统体检与只读健康诊断模块 (System Doctor).
-=========================================================
+乐健体育 · 独立系统体检与非破坏性只读诊断模块 (System Doctor).
+=================================================================
 职责 (M4 独立诊断命令)：
-1. 纯只读系统全面体检：绝对不修改任何凭据、不删除 state.json、不重置数据库、不提交抢课/报名。
+1. 非破坏性只读诊断 (Non-destructive Diagnostics)：
+   - 绝不修改任何用户配置 (config.json, timetable.json)；
+   - 绝不修改或覆盖认证凭据 (credential.json)；
+   - 绝不修改会话数据 (state.json)；
+   - 绝不修改或重置 SQLite 数据库 (采用 mode=ro 只读模式连接)；
+   - 绝不提交抢课、报名或选课修改；
+   - 仅在目录读写权限探测时创建并立即清理专用临时探测文件 (.doctor_probe_*.tmp)；
+   - 在线 Token 验真只读查询，但向服务端发送 HTTP 请求可能产生服务端访问日志等外部痕迹。
 2. 6 大核心维度检查：
-   - 运行环境 (Python 版本、平台与 DPAPI 加密支持、核心依赖、ADB 探测)
-   - 本地存储与配置 (工作目录权限、SQLite 数据库完整性、config.json、timetable.json、未决事务安全性)
+   - 运行环境 (Python 版本、平台与 DPAPI 凭据安全保护、核心依赖、ADB 探测)
+   - 本地存储与配置 (工作目录权限、SQLite 只读完整性检查、config.json、timetable.json、未决事务安全性)
    - 本地认证材料 (credential.json 存在性、DACL 访问控制、DPAPI 解密往返、字段完整性、账号脱敏展示)
    - 本地会话状态 (state.json 存在性、Token 有效期剩余计算、RefreshToken 状态、学校学期信息)
-   - 在线服务与只读连通性 (服务端轻量连通探测、只读在线验证 Token 真伪)
+   - 在线服务与只读连通性 (服务端轻量连通探测、只读在线验证 Token 真伪及细分 401 判定)
    - 总体健康评估与针对性运维建议 (HEALTHY / WARNING / ERROR)
 3. 严格安全脱敏：不输出明文密码、不输出完整 signDigital、不输出完整 Token、不输出 AES 密钥。
 4. 提供结构化纯文本控制台报告 (`format_report`) 与机器可读格式 (`to_dict`)。
@@ -224,14 +231,14 @@ class SystemDoctor:
                 category="runtime",
                 name="平台与加密",
                 status="OK",
-                message=f"{plat_str} (支持 Windows DPAPI 硬件级加密)",
+                message=f"{plat_str} (支持 Windows DPAPI 凭据安全保护)",
             ))
         else:
             report.checks.append(CheckItem(
                 category="runtime",
                 name="平台与加密",
                 status="OK",
-                message=f"{plat_str} (POSIX 权限保护模式)",
+                message=f"{plat_str} (POSIX 受限权限保护模式 chmod 0600，访问控制非加密)",
             ))
 
         # 核心依赖检查
@@ -288,20 +295,40 @@ class SystemDoctor:
     # 2. 本地存储与配置检查
     # -------------------------------------------------------------------------
     def _check_storage_and_config(self, report: DoctorReport) -> None:
-        # 目录读写权限验证 (通过安全临时文件读写测试)
+        target_dirs = [self.data_dir, self.logs_dir, self.captures_dir]
+
+        # 1. 扫描并自愈清理可能因断电异常残留的历史探测文件
+        for d in target_dirs:
+            if os.path.exists(d):
+                try:
+                    for fname in os.listdir(d):
+                        if fname.startswith(".doctor_probe_") and fname.endswith(".tmp"):
+                            try:
+                                os.unlink(os.path.join(d, fname))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        # 2. 目录读写权限验证 (创建临时探测文件并在 finally 中立即清理，非破坏性)
         writable_dirs = []
         unwritable_dirs = []
-        for d in [self.data_dir, self.logs_dir, self.captures_dir]:
+        for d in target_dirs:
+            test_file = None
             try:
                 os.makedirs(d, exist_ok=True)
                 test_file = os.path.join(d, f".doctor_probe_{os.getpid()}_{int(time.time()*1000)}.tmp")
                 with open(test_file, "w", encoding="utf-8") as f:
                     f.write("probe")
-                if os.path.exists(test_file):
-                    os.unlink(test_file)
                 writable_dirs.append(os.path.basename(d))
             except Exception as e:
                 unwritable_dirs.append(f"{os.path.basename(d)} ({e})")
+            finally:
+                if test_file and os.path.exists(test_file):
+                    try:
+                        os.unlink(test_file)
+                    except Exception:
+                        pass
 
         if not unwritable_dirs:
             report.checks.append(CheckItem(
@@ -319,7 +346,7 @@ class SystemDoctor:
                 suggestion="请检查并授予当前用户对 lejianPE 目录的完整读写权限。",
             ))
 
-        # SQLite 状态库检查
+        # 3. SQLite 状态库检查（采用 mode=ro 只读连接，杜绝产生数据库写入或事务日志）
         if not os.path.exists(self.db_path):
             report.checks.append(CheckItem(
                 category="storage",
@@ -329,7 +356,9 @@ class SystemDoctor:
             ))
         else:
             try:
-                conn = sqlite3.connect(self.db_path, timeout=5.0)
+                db_abs = os.path.abspath(self.db_path)
+                db_uri = f"file:{urllib.request.pathname2url(db_abs)}?mode=ro"
+                conn = sqlite3.connect(db_uri, uri=True, timeout=5.0)
                 cur = conn.cursor()
                 cur.execute("PRAGMA integrity_check;")
                 row = cur.fetchone()
@@ -349,7 +378,7 @@ class SystemDoctor:
                         category="storage",
                         name="SQLite 状态库",
                         status="OK",
-                        message=f"data/registration.db 完整性通过 (包含 {record_count} 条抢课记录)",
+                        message=f"data/registration.db 完整性通过 (包含 {record_count} 条抢课记录, 只读连接)",
                     ))
                 else:
                     report.checks.append(CheckItem(
@@ -499,7 +528,7 @@ class SystemDoctor:
                     category="credential",
                     name="凭据保护模式",
                     status="OK",
-                    message="Windows DPAPI 硬件级加密存储 (往返解密测试通过)",
+                    message="Windows DPAPI 凭据安全保护 (往返解密测试通过)",
                 ))
             else:
                 report.checks.append(CheckItem(
@@ -514,7 +543,7 @@ class SystemDoctor:
                 category="credential",
                 name="凭据保护模式",
                 status="OK",
-                message="标准文件权限保护模式 (POSIX chmod 0600)",
+                message="受限文件权限保护模式 (POSIX chmod 0600 访问控制，非加密)",
             ))
         else:
             report.checks.append(CheckItem(
@@ -522,7 +551,7 @@ class SystemDoctor:
                 name="凭据保护模式",
                 status="WARN",
                 message="明文存储模式 (建议使用 Windows DPAPI 加密存储以提升安全性)",
-                suggestion="运行 python lejian.py reinit 可自动升级为 Windows DPAPI 硬件级加密存储。",
+                suggestion="运行 python lejian.py reinit 可自动升级为 Windows DPAPI 凭据安全保护。",
             ))
 
         # 账号与签名有效性
@@ -813,20 +842,54 @@ class SystemDoctor:
                         suggestion="建议运行 python lejian.py refresh 或 python lejian.py setup 重新获取有效 Token。",
                     ))
         except urllib.error.HTTPError as e:
+            raw_err = ""
+            try:
+                raw_err = e.read().decode("utf-8", "ignore")
+            except Exception:
+                pass
+            err_json = {}
+            try:
+                err_json = json.loads(raw_err)
+            except Exception:
+                pass
+
             if e.code == 401:
-                report.checks.append(CheckItem(
-                    category="online",
-                    name="Token 在线验真",
-                    status="ERROR",
-                    message="服务端拒绝 (HTTP 401: Token 无效或已在服务端注销)",
-                    suggestion="请运行 python lejian.py refresh 尝试刷新，或运行 python lejian.py setup 重新登录。",
-                ))
+                b_code = err_json.get("code") if isinstance(err_json, dict) else None
+                b_msg = (err_json.get("message") or "") if isinstance(err_json, dict) else ""
+
+                if b_code is not None and ("expire" in b_msg.lower() or "过期" in b_msg):
+                    report.checks.append(CheckItem(
+                        category="online",
+                        name="Token 在线验真",
+                        status="WARN",
+                        message=f"服务端确认 Token 已过期 (code={b_code}: {b_msg})",
+                        suggestion="请运行 python lejian.py refresh 尝试静默刷新，或运行 python lejian.py setup 重新登录。",
+                    ))
+                elif b_code is not None and ("revoke" in b_msg.lower() or "撤销" in b_msg or "失效" in b_msg):
+                    report.checks.append(CheckItem(
+                        category="online",
+                        name="Token 在线验真",
+                        status="ERROR",
+                        message=f"服务端确认 Token 已被撤销 (code={b_code}: {b_msg})",
+                        suggestion="凭据已被撤销，请运行 python lejian.py setup 重新登录。",
+                    ))
+                else:
+                    detail_str = f"业务响应: {raw_err[:150]}" if raw_err else "服务端未返回详细错误体"
+                    report.checks.append(CheckItem(
+                        category="online",
+                        name="Token 在线验真",
+                        status="WARN",
+                        message="在线验证未通过: 服务端返回 HTTP 401 未授权响应 (具体原因暂时无法确定)",
+                        detail=detail_str,
+                        suggestion="建议运行 python lejian.py status 检查，或运行 python lejian.py setup 重新验证登录。",
+                    ))
             else:
                 report.checks.append(CheckItem(
                     category="online",
                     name="Token 在线验真",
                     status="WARN",
                     message=f"服务端响应 HTTP {e.code}",
+                    detail=raw_err[:200] if raw_err else None,
                 ))
         except Exception as e:
             report.checks.append(CheckItem(

@@ -371,37 +371,65 @@ class SystemDoctorTestSuite(unittest.TestCase):
         self.assertIn("离线", net_item.message)
 
     # -------------------------------------------------------------------------
-    # D14: Token 在线只读验真被服务端 401 拒绝
+    # D14: Token 在线只读验真细分区分 HTTP 401
     # -------------------------------------------------------------------------
-    def test_D14_online_token_validation_server_401_reports_error(self):
-        """D14: 在线请求 getCurrentSemester 返回 401 时标红 ERROR 并提示 Token 作废"""
+    def test_D14_online_token_validation_server_401_nuanced_handling(self):
+        """D14: 细分处理 401：无明确原因时报 WARN 提示暂时无法确定，有明确撤销时标红 ERROR"""
         self._setup_healthy_environment()
 
-        def mock_urlopen_fn(req, *args, **kwargs):
+        # 1. 模拟未携带结构化原因的普通 401：避免武断断言失效，报告 WARN 与未知原因
+        class MockGeneric401Error(urllib.error.HTTPError):
+            def __init__(self, url):
+                super().__init__(url, 401, "Unauthorized", {}, None)
+            def read(self):
+                return b'{"message": "Unauthorized"}'
+
+        def mock_generic_401(req, *args, **kwargs):
             url = getattr(req, "full_url", str(req))
             if "education/semester/getCurrent" in url:
-                raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
-            # 基础网络可达
+                raise MockGeneric401Error(url)
             class MockResp:
-                def __init__(self):
-                    self.status = 200
-                def read(self):
-                    return b"ok"
-                def __enter__(self):
-                    return self
-                def __exit__(self, *args):
-                    pass
+                def __init__(self): self.status = 200
+                def read(self): return b"ok"
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
             return MockResp()
 
         doctor = SystemDoctor(root_dir=self.test_dir)
-        with patch("urllib.request.urlopen", side_effect=mock_urlopen_fn):
+        with patch("urllib.request.urlopen", side_effect=mock_generic_401):
             report = doctor.run_diagnostics(online_probe=True)
 
         token_online_item = next((c for c in report.checks if c.name == "Token 在线验真"), None)
         self.assertIsNotNone(token_online_item)
-        self.assertEqual(token_online_item.status, "ERROR")
-        self.assertIn("HTTP 401", token_online_item.message)
-        self.assertEqual(report.overall_status, "ERROR")
+        self.assertEqual(token_online_item.status, "WARN")
+        self.assertIn("未授权响应", token_online_item.message)
+        self.assertIn("暂时无法确定", token_online_item.message)
+
+        # 2. 模拟明确返回已撤销原因的 401：标红 ERROR 并确认已撤销
+        class MockRevoked401Error(urllib.error.HTTPError):
+            def __init__(self, url):
+                super().__init__(url, 401, "Unauthorized", {}, None)
+            def read(self):
+                return json.dumps({"code": 40101, "message": "Token已被撤销"}).encode("utf-8")
+
+        def mock_revoked_401(req, *args, **kwargs):
+            url = getattr(req, "full_url", str(req))
+            if "education/semester/getCurrent" in url:
+                raise MockRevoked401Error(url)
+            class MockResp:
+                def __init__(self): self.status = 200
+                def read(self): return b"ok"
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+            return MockResp()
+
+        with patch("urllib.request.urlopen", side_effect=mock_revoked_401):
+            report_revoked = doctor.run_diagnostics(online_probe=True)
+
+        token_revoked_item = next((c for c in report_revoked.checks if c.name == "Token 在线验真"), None)
+        self.assertIsNotNone(token_revoked_item)
+        self.assertEqual(token_revoked_item.status, "ERROR")
+        self.assertIn("已被撤销", token_revoked_item.message)
 
     # -------------------------------------------------------------------------
     # D15: 全程脱敏安全校验
@@ -445,29 +473,31 @@ class SystemDoctorTestSuite(unittest.TestCase):
     # D17: 纯只读保证校验 (执行体检不改变任何现有文件与数据)
     # -------------------------------------------------------------------------
     def test_D17_pure_read_only_guarantee(self):
-        """D17: 体检执行前后现有文件 mtime 与大小完全不变，不产生孤儿垃圾文件"""
+        """D17: 非破坏性只读验证：体检执行前后关键凭据/会话/DB SHA-256 绝对一致，临时探测文件被立即清理"""
+        import hashlib
         self._setup_healthy_environment()
 
-        with open(self.cred_path, "rb") as f:
-            before_cred_content = f.read()
-        with open(self.state_path, "rb") as f:
-            before_state_content = f.read()
-        with open(self.db_path, "rb") as f:
-            before_db_content = f.read()
+        def sha256_of(file_path):
+            h = hashlib.sha256()
+            with open(file_path, "rb") as f:
+                h.update(f.read())
+            return h.hexdigest()
+
+        before_cred_sha = sha256_of(self.cred_path)
+        before_state_sha = sha256_of(self.state_path)
+        before_db_sha = sha256_of(self.db_path)
 
         doctor = SystemDoctor(root_dir=self.test_dir)
         report = doctor.run_diagnostics(online_probe=False)
 
-        with open(self.cred_path, "rb") as f:
-            after_cred_content = f.read()
-        with open(self.state_path, "rb") as f:
-            after_state_content = f.read()
-        with open(self.db_path, "rb") as f:
-            after_db_content = f.read()
+        after_cred_sha = sha256_of(self.cred_path)
+        after_state_sha = sha256_of(self.state_path)
+        after_db_sha = sha256_of(self.db_path)
 
-        self.assertEqual(before_cred_content, after_cred_content)
-        self.assertEqual(before_state_content, after_state_content)
-        self.assertEqual(before_db_content, after_db_content)
+        # 密码学哈希比对，验证数据字节级绝对不可变
+        self.assertEqual(before_cred_sha, after_cred_sha)
+        self.assertEqual(before_state_sha, after_state_sha)
+        self.assertEqual(before_db_sha, after_db_sha)
 
         # 确认没有残留探针临时文件
         for root, _, files in os.walk(self.test_dir):

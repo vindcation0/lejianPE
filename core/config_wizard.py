@@ -359,7 +359,7 @@ class ConfigWizard:
             "                 环境自检报告",
             "=" * 55,
             f"Python 版本  : {env_report['python_version']} ({'符合要求' if env_report['python_ok'] else '过低，建议 >= 3.8'})",
-            f"运行平台     : {sys.platform} ({'支持 Windows DPAPI 硬件级加密' if env_report['dpapi_supported'] else '标准 POSIX 安全模式'})",
+            f"运行平台     : {sys.platform} ({'支持 Windows DPAPI 凭据安全保护' if env_report['dpapi_supported'] else 'POSIX 受限权限保护模式'})",
             f"SQLite 驱动  : {env_report['sqlite_desc']}",
             f"网络连通性   : {env_report['network_desc']}",
             f"安卓 ADB 工具: {env_report['adb_path']}",
