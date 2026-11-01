@@ -6,7 +6,7 @@ import lejian as L
 cfg = L.load_json(L.CONFIG, {})
 tt = L.load_timetable()
 c = L.Client(L.load_json(L.STATE))
-cw = L.current_week(cfg, tt)
+cw = L.current_week(tt)
 max_normal = int(cfg.get("max_normal", 2))
 
 deadline = time.time() + 1800

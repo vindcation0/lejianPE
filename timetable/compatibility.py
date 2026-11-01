@@ -48,7 +48,8 @@ def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
             # 严格校验：不允许静默忽略错误记录
             raise ValidationError(f"解析课程记录失败: {e}", index=idx) from e
 
-    tt = Timetable(week1_monday=w1, busy_slots=slots, schema_version=2)
+    total_w = int(data.get("total_weeks", 16))
+    tt = Timetable(week1_monday=w1, busy_slots=slots, total_weeks=total_w, schema_version=2)
     tt.deduplicate()
     return tt
 
@@ -61,7 +62,7 @@ def load_timetable_file(path: str) -> Timetable:
     if not os.path.exists(path):
         today = datetime.date.today()
         monday = today - datetime.timedelta(days=today.weekday())
-        return Timetable(week1_monday=monday.isoformat(), busy_slots=[], schema_version=2)
+        return Timetable(week1_monday=monday.isoformat(), busy_slots=[], total_weeks=16, schema_version=2)
 
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)

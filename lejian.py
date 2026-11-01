@@ -326,14 +326,51 @@ def load_timetable():
     return d
 
 
-def current_week(cfg, tt):
-    return int(cfg.get("current_week") or tt.get("current_week") or 8)
-
-
 def week_of(date_obj, tt):
     """绝对锚点换算：第 1 周周一 = week1_monday，与运行日期无关"""
     d = datetime.date.fromisoformat(tt["week1_monday"])
     return (date_obj - d).days // 7 + 1
+
+
+def current_week(arg1, arg2=None, today=None):
+    """
+    根据 timetable 里的 week1_monday 和日期（默认为系统今日）动态推算当前教学周。
+    统一复用 week_of()。
+    支持调用签名：
+      current_week(tt, today=None)
+      current_week(cfg, tt, today=None)  # 向下兼容旧调用，但严格不读 cfg['current_week']
+    """
+    if arg2 is not None:
+        if isinstance(arg2, (datetime.date, datetime.datetime)):
+            tt = arg1
+            today = arg2
+        else:
+            tt = arg2
+    else:
+        tt = arg1
+
+    if today is None:
+        today = datetime.date.today()
+    return week_of(today, tt)
+
+
+def get_semester_status(tt, today=None):
+    """
+    返回学期状态元组: (status_text, week_num, total_weeks)
+    - 开学前: status_text="尚未开学", week_num < 1
+    - 正常教学周: status_text="正常教学周", 1 <= week_num <= total_weeks
+    - 学期结束后: status_text="学期已结束", week_num > total_weeks
+    """
+    if today is None:
+        today = datetime.date.today()
+    cw = week_of(today, tt)
+    tw = int(tt.get("total_weeks", 16))
+    if cw < 1:
+        return "尚未开学", cw, tw
+    elif cw > tw:
+        return "学期已结束", cw, tw
+    else:
+        return "正常教学周", cw, tw
 
 
 def hhmm(t):
@@ -510,11 +547,10 @@ def cmd_list():
         return
     items = c.activities()
     tt = load_timetable()
-    cw = current_week(cfg, tt)
-    busy = busy_for_week(cfg, tt, cw)
-    log(f"活动总数 {len(items)}  |  第 {cw} 教学周，已占用 {len(busy)} 个时段")
-    for s, why in busy:
-        log(f"  {slot_text(s)}  <- {why}")
+    cw = current_week(tt)
+    status_text, _, tw = get_semester_status(tt)
+    week_desc = f"第 {cw} 教学周" if 1 <= cw <= tw else f"第 {cw} 周（{status_text}）"
+    log(f"活动总数 {len(items)}  |  当前教学周：{week_desc}")
 
     by_week = {}
     for i in items:
@@ -635,7 +671,10 @@ def _cmd_grab_inner(cfg, st):
                 time.sleep(max(min(left, 1), 0.05))
 
     tt = load_timetable()
-    cw = current_week(cfg, tt)
+    cw = current_week(tt)
+    status_text, _, tw = get_semester_status(tt)
+    if cw < 1 or cw > tw:
+        log(f"[学期状态提示] 当前为第 {cw} 周（{status_text}），第一教学周为 {tt.get('week1_monday')}，学期总周数 {tw} 周。")
     busy = busy_for_week(cfg, tt, cw)
     log(f"第 {cw} 教学周，已占用 {len(busy)} 个时段：")
     for s, why in busy:
@@ -838,8 +877,24 @@ def cmd_names():
 def cmd_timetable():
     cfg = load_json(CONFIG, {})
     tt = load_timetable()
-    cw = current_week(cfg, tt)
-    log(f"当前第 {cw} 教学周（第 1 周周一 = {tt['week1_monday']}，共 {len(tt.get('courses') or [])} 门课）")
+    today = datetime.date.today()
+    cw = current_week(tt, today=today)
+    total_weeks = int(tt.get("total_weeks", 16))
+    status_text, _, _ = get_semester_status(tt, today=today)
+    if 1 <= cw <= total_weeks:
+        cw_display = f"第 {cw} 周"
+    else:
+        cw_display = f"第 {cw} 周（{status_text}）"
+
+    log("=" * 50)
+    log("                 课表与周次")
+    log("=" * 50)
+    log("")
+    log(f"第一教学周周一：{tt.get('week1_monday', '-')}")
+    log(f"学期总周数：{total_weeks}")
+    log(f"当前日期：{today.isoformat()}")
+    log(f"当前教学周：{cw_display}")
+    log("")
 
     reg = {}
     st = load_json(STATE)
@@ -856,13 +911,27 @@ def cmd_timetable():
                 w = week_of(datetime.date.fromtimestamp(int(i["startTime"]) / 1000), tt)
                 reg.setdefault(w, []).append((a, "已抢:" + (i.get("name") or "")))
         except Exception as e:
-            log(f"（未能联网拉取已报活动: {e}，展示本地课表）")
+            log(f"（未能联网拉取已报活动: {e}，仅展示本地课表）")
 
-    for w in (cw, cw + 1):
-        busy = busy_for_week(cfg, tt, w) + reg.get(w, [])
-        log(f"第{w}周占用 {len(busy)} 个时段：")
-        for s, why in sorted(busy, key=lambda x: (x[0][0], x[0][1])):
-            log(f"  {slot_text(s)}  <- {why}")
+    # 当前周
+    log("---------------- 当前周 ----------------")
+    busy_curr = busy_for_week(cfg, tt, cw) + reg.get(cw, [])
+    sorted_curr = sorted(busy_curr, key=lambda x: (x[0][0], x[0][1]))
+    log(f"第 {cw} 周占用 {len(sorted_curr)} 个时段：")
+    for s, why in sorted_curr:
+        log(f"  {slot_text(s)} <- {why}")
+    log("")
+
+    # 下一周
+    next_w = cw + 1
+    log("---------------- 下一周 ----------------")
+    busy_next = busy_for_week(cfg, tt, next_w) + reg.get(next_w, [])
+    sorted_next = sorted(busy_next, key=lambda x: (x[0][0], x[0][1]))
+    log(f"第 {next_w} 周占用 {len(sorted_next)} 个时段：")
+    for s, why in sorted_next:
+        log(f"  {slot_text(s)} <- {why}")
+    log("")
+    log("=" * 50)
 
 
 def cmd_editor():

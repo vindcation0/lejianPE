@@ -4,7 +4,7 @@ import lejian as L
 
 cfg = L.load_json(L.CONFIG, {})
 tt = L.load_timetable()
-cw = L.current_week(cfg, tt)
+cw = L.current_week(tt)
 c = L.Client(L.load_json(L.STATE))
 items = c.activities()
 

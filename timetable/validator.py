@@ -41,9 +41,17 @@ def validate_timetable_dict(data: Any) -> None:
     if not w1 or not isinstance(w1, str):
         raise ValidationError("缺少必需的 week1_monday 字段", field="week1_monday")
     try:
-        datetime.date.fromisoformat(w1.strip())
+        w1_date = datetime.date.fromisoformat(w1.strip())
     except Exception:
         raise ValidationError(f"week1_monday 必须是合法的 YYYY-MM-DD 日期，当前值: {w1!r}", field="week1_monday")
+    if w1_date.weekday() != 0:
+        raise ValidationError("第一教学周日期必须为星期一，请检查 week1_monday。", field="week1_monday")
+
+    # 2.5 total_weeks
+    tw = data.get("total_weeks")
+    if tw is not None:
+        if not isinstance(tw, int) or isinstance(tw, bool) or tw < 1 or tw > 53:
+            raise ValidationError(f"total_weeks 必须为 1~53 的整数，当前值: {tw!r}", field="total_weeks")
 
     # 3. busy_slots
     slots = data.get("busy_slots")

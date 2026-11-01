@@ -94,11 +94,13 @@ class Timetable:
         self,
         week1_monday: str,
         busy_slots: Optional[List[TimeSlot]] = None,
+        total_weeks: int = 16,
         schema_version: int = 2
     ):
         self.schema_version = schema_version
         self.week1_monday = str(week1_monday).strip()
         self.busy_slots: List[TimeSlot] = busy_slots or []
+        self.total_weeks: int = int(total_weeks) if total_weeks is not None else 16
 
     def add_slot(self, slot: TimeSlot):
         self.busy_slots.append(slot)
@@ -130,6 +132,7 @@ class Timetable:
         return {
             "schema_version": self.schema_version,
             "week1_monday": self.week1_monday,
+            "total_weeks": self.total_weeks,
             "busy_slots": [s.to_dict() for s in self.busy_slots]
         }
 
@@ -137,9 +140,10 @@ class Timetable:
     def from_dict(cls, data: Dict[str, Any]) -> "Timetable":
         w1 = data.get("week1_monday", "2026-08-31")
         v = data.get("schema_version", 2)
+        total_w = data.get("total_weeks", 16)
         raw_slots = data.get("busy_slots", [])
         slots = [TimeSlot.from_dict(s) for s in raw_slots]
-        return cls(week1_monday=w1, busy_slots=slots, schema_version=v)
+        return cls(week1_monday=w1, busy_slots=slots, total_weeks=total_w, schema_version=v)
 
     def __repr__(self):
-        return f"<Timetable v{self.schema_version} week1={self.week1_monday} slots={len(self.busy_slots)}>"
+        return f"<Timetable v{self.schema_version} week1={self.week1_monday} total_weeks={self.total_weeks} slots={len(self.busy_slots)}>"

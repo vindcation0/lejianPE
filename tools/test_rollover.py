@@ -39,7 +39,7 @@ fakes = [
     fake("排球", wk9_wed),
 ]
 
-picked = L.pick_targets(items + fakes, cfg, tt, L.current_week(cfg, tt))
+picked = L.pick_targets(items + fakes, cfg, tt, L.current_week(tt))
 fake_ids = {p[1]["id"] for p in picked if p[1]["id"].startswith("FAKE")}
 
 print("第9周假活动通过筛选的情况：")

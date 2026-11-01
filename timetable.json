@@ -1,6 +1,7 @@
 {
   "schema_version": 2,
   "week1_monday": "2026-08-31",
+  "total_weeks": 16,
   "busy_slots": [
     {
       "weekday": 1,

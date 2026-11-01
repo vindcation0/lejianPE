@@ -116,7 +116,7 @@
       </div>
       <div class="config-item">
         <label for="total-weeks">学期总周数：</label>
-        <input type="number" id="total-weeks" value="16" min="1" max="30" style="width: 70px;">
+        <input type="number" id="total-weeks" value="16" min="1" max="53" style="width: 70px;" onchange="onTotalWeeksChange()" oninput="onTotalWeeksChange()">
       </div>
       <div class="config-item" style="margin-left: auto;">
         <label for="filter-week">🔍 按周过滤预览：</label>
@@ -222,13 +222,26 @@
     setTimeout(() => { el.className = ''; }, 3000);
   }
 
+  function onTotalWeeksChange() {
+    const totalInput = document.getElementById('total-weeks');
+    let totalWeeks = parseInt(totalInput.value) || 16;
+    if (totalWeeks < 1) totalWeeks = 1;
+    if (totalWeeks > 53) totalWeeks = 53;
+    totalInput.value = totalWeeks;
+    initWeeksFilter(totalWeeks);
+    renderCustomWeeksCheckboxes(totalWeeks);
+    renderGrid();
+  }
+
   function initWeeksFilter(totalWeeks) {
     const sel = document.getElementById('filter-week');
+    const prevVal = parseInt(sel.value) || 0;
     sel.innerHTML = '<option value="0">全部周次（综合视图）</option>';
     for (let w = 1; w <= totalWeeks; w++) {
       const opt = document.createElement('option');
       opt.value = w;
       opt.innerText = `第 ${w} 周视图`;
+      if (w === prevVal) opt.selected = true;
       sel.appendChild(opt);
     }
   }
@@ -445,6 +458,12 @@
       if (data.week1_monday) {
         document.getElementById('week1-monday').value = data.week1_monday;
       }
+      if (data.total_weeks) {
+        const tw = parseInt(data.total_weeks) || 16;
+        document.getElementById('total-weeks').value = tw;
+        initWeeksFilter(tw);
+        renderCustomWeeksCheckboxes(tw);
+      }
 
       // 如果有已保存的 busy_slots
       if (Array.isArray(data.busy_slots) && data.busy_slots.length > 0) {
@@ -468,7 +487,7 @@
             const key = `${rowIdx}_${s.weekday}`;
             // 判定模式
             let mode = 'custom';
-            if (s.weeks.length === 1 && s.weeks[0][0] === 1 && s.weeks[0][1] >= 16) {
+            if (s.weeks.length === 1 && s.weeks[0][0] === 1 && s.weeks[0][1] >= totalWeeks) {
               mode = 'every';
             }
             busyMap[key] = {
@@ -490,6 +509,7 @@
   async function saveToBackend() {
     // 构造 payload
     const w1 = document.getElementById('week1-monday').value;
+    const totalWeeks = parseInt(document.getElementById('total-weeks').value) || 16;
     const busySlotsList = [];
 
     Object.keys(busyMap).forEach(key => {
@@ -508,9 +528,26 @@
       }
     });
 
+    let hasExceededWeeks = false;
+    let maxExceeded = 0;
+    busySlotsList.forEach(s => {
+      (s.weeks || []).forEach(([a, b]) => {
+        if (b > totalWeeks) {
+          hasExceededWeeks = true;
+          if (b > maxExceeded) maxExceeded = b;
+        }
+      });
+    });
+    if (hasExceededWeeks) {
+      if (!confirm(`提示：部分已标记时段的周次（最高第 ${maxExceeded} 周）超出了当前设置的总周数（${totalWeeks} 周）。\n确定仍保留这些周次数据并保存吗？`)) {
+        return;
+      }
+    }
+
     const payload = {
       schema_version: 2,
       week1_monday: w1,
+      total_weeks: totalWeeks,
       busy_slots: busySlotsList
     };
 
