@@ -17,6 +17,7 @@ if ROOT not in sys.path:
 if os.path.join(ROOT, "tools") not in sys.path:
     sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+from core.auth_diagnostics import diagnose_auth_error, handle_login_failure
 from core.auth_error import (
     AuthError,
     AuthNetworkError,
@@ -157,10 +158,7 @@ def main():
     try:
         cred = storage.load_credential()
     except CredentialError as e:
-        print(f"\n❌ 凭据异常: {e}")
-        print("请先初始化认证材料：")
-        print("  python tools\\login_cli.py --setup captures\\login_flows.jsonl")
-        print("或在菜单中选择 [b] 重新抓取登录签名")
+        handle_login_failure(e, context={"stage": "load_credential"})
         sys.exit(1)
 
     account = cred["account"]
@@ -191,29 +189,8 @@ def main():
             sign_digital=cred["signDigital"],
             entrance=cred.get("entrance", "1"),
         )
-    except BusinessAuthError as e:
-        print(f"\n❌ 业务认证失败: {e}")
-        if e.code == 50004 or "签名" in str(e):
-            print("  [原因分析] 服务端判定签名校验不匹配。")
-            print("  签名是由「账号 + 密码 + entrance」通过客户端底层计算得出。")
-            print("  若您曾在 App 端修改过密码，旧签名将永久失效。")
-            print("  [解决建议]")
-            print("    1. 请先通过模拟器登录并重新抓包生成认证材料：")
-            print("       python tools\\capture_login.py")
-            print("    2. 或在主菜单中选 [a] 临时使用模拟器同步 Token。")
-        elif "密码" in str(e) or "账号" in str(e):
-            print("  [解决建议] 请核对输入的密码是否正确。")
-        sys.exit(1)
-    except AuthNetworkError as e:
-        print(f"\n❌ 网络连接异常: {e}")
-        print("  [解决建议] 请检查网络连通性或稍后重试。")
-        sys.exit(1)
-    except (TokenAcquisitionError, SchoolInfoError, SemesterInfoError) as e:
-        print(f"\n❌ 认证数据异常: {e}")
-        print("  [安全保护] 登录未成功落地，已完整保留原有的 state.json。")
-        sys.exit(1)
-    except AuthError as e:
-        print(f"\n❌ 登录失败: {e}")
+    except Exception as e:
+        handle_login_failure(e, context={"stage": "login", "account": account})
         sys.exit(1)
     finally:
         # 及时释放内存中的密码引用
@@ -240,8 +217,7 @@ def main():
             saved_state = auth_mgr.save_state_atomically(data, STATE_FILE)
             print(f"  已成功写入 : state.json (学期 ID: {saved_state.get('semesterId')})")
         except Exception as e:
-            print(f"\n❌ 保存 state.json 失败: {e}")
-            print("  原有 state.json 保持完好。")
+            handle_login_failure(e, context={"stage": "save_state", "account": account})
             sys.exit(1)
 
 
