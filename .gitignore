@@ -11,6 +11,8 @@ credentials/
 # 临时与备份产物
 *.tmp
 *.bak
+*.tx.json
+*.tx_bak
 
 # ===== 抓包与导出：体积大且含个人数据 =====
 captures/

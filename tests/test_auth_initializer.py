@@ -1,7 +1,7 @@
 """
-乐健体育 · 认证重新初始化统一流程自动化测试套件 (I01 ~ I16)。
+乐健体育 · 认证重新初始化统一流程自动化测试套件 (I01 ~ I18)。
 ==============================================================
-覆盖执行计划 M2 (第二阶段) 全部验收指标：
+覆盖执行计划 M2 (第二阶段) 全部验收指标及事务增强：
 1. 本地状态检查与脱敏报告 (check_status)
 2. 抓包流量文件凭据提取与异常解析 (extract_from_flows)
 3. 凭据合法性校验 (verify_new_credential)
@@ -18,6 +18,8 @@
 14. reinitialize 中途异常中止时绝不破坏原有有效凭据
 15. 敏感信息全方位脱敏校验 (绝不含明文密码、完整 Token、signDigital)
 16. lejian.py reinit 与 menu.py 统一入口路由协同
+17. 跨文件复合事务保护：凭据替换成功后 state.json 更新失败，自动回滚恢复旧凭据与旧会话 (I17)
+18. 未决事务开机自检与自动恢复机制 (I18)
 """
 import io
 import json
@@ -398,6 +400,111 @@ class AuthInitializerTestSuite(unittest.TestCase):
         with patch("core.auth_initializer.AuthInitializer.reinitialize") as mock_reinit:
             lejian.cmd_reinit()
             mock_reinit.assert_called_once()
+
+    # ==================== I17: 跨文件复合事务保护（凭据替换成功后 state 写入失败自动回滚） ====================
+    def test_I17_composite_transaction_rollback_on_session_failure(self):
+        """I17: 凭据替换成功后，state.json 写入失败，验证旧凭据和旧会话能够完整恢复"""
+        # 1. 预先设置旧凭据和旧会话
+        self.initializer.storage.save_credential("13800138000", "old_safe_signature_111", use_dpapi=False)
+        old_state_data = {
+            "accessToken": "tok_old_valid_111",
+            "refreshToken": "ref_old_valid_111",
+            "schoolId": "sch_old_111",
+            "semesterId": "sem_old_111",
+            "accessTokenExpires": int((time.time() + 3600) * 1000),
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(old_state_data, f)
+
+        # 2. 模拟抓包获得新凭据
+        self._create_mock_flows(account="13800138000", sign_digital="new_captured_signature_222", entrance="1")
+
+        mock_login_data = {
+            "accessToken": "tok_new_222",
+            "refreshToken": "ref_new_222",
+            "schoolId": "sch_new_222",
+        }
+
+        # 3. 模拟第 5 步凭据写入成功，但第 6 步 update_session_atomically 发生异常（如拉取学期网络崩溃）
+        stdout_buf = io.StringIO()
+        with patch.object(self.initializer.auth_manager, "login", return_value=mock_login_data), \
+             patch.object(self.initializer, "update_session_atomically", side_effect=SemesterInfoError("模拟网络异常：学期信息获取失败")), \
+             patch("sys.stdout", stdout_buf):
+            ok = self.initializer.reinitialize(
+                password="MyPassword123",
+                flows_path=self.flows_path,
+                interactive=False,
+            )
+            self.assertFalse(ok, "当会话更新失败时，reinitialize 应当返回 False")
+
+        out = stdout_buf.getvalue()
+        self.assertIn("自动回滚凭据与会话", out)
+        self.assertIn("旧凭据与旧会话已完全恢复", out)
+
+        # 4. 关键验证：原凭据依然是旧凭据，原会话依然是旧会话！
+        loaded_cred = self.initializer.storage.load_credential()
+        self.assertEqual(loaded_cred["signDigital"], "old_safe_signature_111", "凭据未能回滚恢复为原有旧凭据！")
+
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            restored_state = json.load(f)
+        self.assertEqual(restored_state["accessToken"], "tok_old_valid_111", "会话未能保持原有旧会话！")
+        self.assertEqual(restored_state["semesterId"], "sem_old_111")
+
+        # 5. 验证事务临时文件已被清理
+        self.assertFalse(os.path.exists(self.initializer.tx_path))
+        self.assertFalse(os.path.exists(self.initializer.cred_tx_bak))
+        self.assertFalse(os.path.exists(self.initializer.state_tx_bak))
+
+    # ==================== I18: 未决事务开机自检与自动恢复机制 ====================
+    def test_I18_pending_transaction_auto_recovery_on_startup(self):
+        """I18: 模拟中途断电/进程被杀遗留未决事务，验证下次启动调用 check_status 时自动回滚恢复"""
+        # 1. 模拟遗留的旧凭据备份与被替换的新凭据
+        old_cred_content = {
+            "account": "13800138000",
+            "signDigital": "legacy_backup_signature",
+            "entrance": "1",
+        }
+        with open(self.initializer.cred_tx_bak, "w", encoding="utf-8") as f:
+            json.dump(old_cred_content, f)
+
+        # 当前磁盘凭据被写入了新凭据
+        bad_cred_content = {
+            "account": "13800138000",
+            "signDigital": "corrupted_half_written_new_sig",
+            "entrance": "1",
+        }
+        with open(self.cred_path, "w", encoding="utf-8") as f:
+            json.dump(bad_cred_content, f)
+
+        # 遗留未 COMMITTED 的事务记录
+        tx_data = {
+            "tx_id": "tx_crash_test",
+            "status": "CRED_APPLIED",
+            "cred_path": self.cred_path,
+            "cred_had_existed": True,
+            "cred_tx_bak": self.initializer.cred_tx_bak,
+            "state_path": self.state_path,
+            "state_had_existed": False,
+            "state_tx_bak": None,
+        }
+        with open(self.initializer.tx_path, "w", encoding="utf-8") as f:
+            json.dump(tx_data, f)
+
+        # 2. 模拟新会话启动：调用 check_status()
+        stdout_buf = io.StringIO()
+        with patch("sys.stdout", stdout_buf):
+            status = self.initializer.check_status()
+
+        out = stdout_buf.getvalue()
+        self.assertIn("检测到上次未完成的重新初始化事务", out)
+
+        # 3. 验证凭据已自动回滚为旧凭据
+        loaded = self.initializer.storage.load_credential()
+        self.assertEqual(loaded["signDigital"], "legacy_backup_signature")
+
+        # 4. 验证事务记录已清理
+        self.assertFalse(os.path.exists(self.initializer.tx_path))
+        self.assertFalse(os.path.exists(self.initializer.cred_tx_bak))
 
 
 if __name__ == "__main__":

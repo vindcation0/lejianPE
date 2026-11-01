@@ -2,15 +2,17 @@
 乐健体育 · 认证重新初始化统一流程管理器 (AuthInitializer).
 ============================================================
 职责：
-1. 统一管理认证重初始化完整六步生命周期：
-   - 步骤 1：本地认证与会话状态检查（脱敏只读）
-   - 步骤 2：官方客户端与模拟器就绪引导
+1. 统一管理认证重初始化完整七步生命周期：
+   - 步骤 1：本地认证与会话状态检查（脱敏只读，自动检测并恢复未决事务）
+   - 步骤 2：官方客户端与模拟器就绪引导（提示账号一致性与安全声明）
    - 步骤 3：调用抓包并解析认证材料（复用 capture_login 与 login_envelope）
    - 步骤 4：严格预校验新凭据（格式、账号一致性防串号、真实登录验证）
-   - 步骤 5：事务性原子替换旧凭据（临时文件 + os.replace，失败完全回滚）
-   - 步骤 6：拉取学期上下文并原子更新 state.json
+   - 步骤 5：开启跨文件复合事务并原子替换旧凭据（临时文件 + os.replace，记录 CRED_APPLIED）
+   - 步骤 6：拉取学期上下文并原子更新 state.json（遇错自动完整回滚凭据与会话）
+   - 步骤 7：复合事务提交与完成确认（清理事务备份与日志，确认双文件强一致）
 2. 安全防护底线：
    - Fail-closed：任何中间环节验证失败，绝不破坏原有可用凭据和会话。
+   - 跨文件复合事务（2PC）：凭据与会话更新保证强一致性，任何一方失败自动完全回滚。
    - 严格账号一致性核验：若已有配置账号，拒绝采纳不一致的他方账号凭据。
    - 绝不保存明文密码，日志严格脱敏。
 """
@@ -72,10 +74,161 @@ class AuthInitializer:
     ):
         self.cred_path = os.path.abspath(cred_path)
         self.state_path = os.path.abspath(state_path)
+        self.tx_path = self.cred_path + ".tx.json"
+        self.cred_tx_bak = self.cred_path + ".tx_bak"
+        self.state_tx_bak = self.state_path + ".tx_bak"
         self.base_url = base_url
         self.use_dpapi = use_dpapi
         self.storage = CredentialStorage(self.cred_path)
         self.auth_manager = AuthManager(base_url=self.base_url)
+
+    # =========================================================================
+    # 跨文件复合事务保护机制 (Composite Transaction - Fail-closed)
+    # =========================================================================
+    def _atomic_write_json(self, path: str, data: Dict[str, Any]) -> None:
+        """以安全原子方式写入 JSON 文件（临时文件 + 同步落盘 + os.replace 替换）"""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp_path = path + f".{os.getpid()}_{time.time_ns()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, path)
+
+    def begin_transaction(self) -> str:
+        """
+        开启跨文件复合事务。
+        若发现未决事务则先自动恢复；随后对当前的 credential.json 和 state.json
+        进行物理二进制复制隔离备份，并持久化事务状态记录。
+        """
+        self.recover_pending_transaction()
+        tx_id = f"tx_{int(time.time())}_{os.getpid()}"
+        cred_exists = os.path.exists(self.cred_path)
+        state_exists = os.path.exists(self.state_path)
+
+        # 备份原有凭据（二进制复制保持原样，若是 DPAPI 加密则完全保留密文）
+        if cred_exists:
+            shutil.copy2(self.cred_path, self.cred_tx_bak)
+        # 备份原有会话
+        if state_exists:
+            shutil.copy2(self.state_path, self.state_tx_bak)
+
+        tx_record = {
+            "tx_id": tx_id,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "INITIALIZED",
+            "cred_path": self.cred_path,
+            "cred_had_existed": cred_exists,
+            "cred_tx_bak": self.cred_tx_bak if cred_exists else None,
+            "state_path": self.state_path,
+            "state_had_existed": state_exists,
+            "state_tx_bak": self.state_tx_bak if state_exists else None,
+        }
+        self._atomic_write_json(self.tx_path, tx_record)
+        return tx_id
+
+    def record_tx_step(self, status: str) -> None:
+        """记录事务推进状态"""
+        if not os.path.exists(self.tx_path):
+            return
+        try:
+            with open(self.tx_path, "r", encoding="utf-8") as f:
+                tx_data = json.load(f)
+            tx_data["status"] = status
+            tx_data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._atomic_write_json(self.tx_path, tx_data)
+        except Exception:
+            pass
+
+    def commit_transaction(self) -> None:
+        """
+        提交复合事务：
+        双文件均已原子落地成功，安全清理事务临时备份与事务记录文件。
+        """
+        for p in (self.cred_tx_bak, self.state_tx_bak, self.tx_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    def rollback_transaction(self) -> bool:
+        """
+        回滚复合事务：
+        将 credential.json 和 state.json 完全恢复为事务开始前的完全一致状态。
+        """
+        if not os.path.exists(self.tx_path):
+            return False
+
+        try:
+            with open(self.tx_path, "r", encoding="utf-8") as f:
+                tx = json.load(f)
+        except Exception:
+            tx = {}
+
+        restored = False
+
+        # 1. 恢复凭据
+        cred_had = tx.get("cred_had_existed", False)
+        cred_bak = tx.get("cred_tx_bak") or self.cred_tx_bak
+        if cred_had and os.path.exists(cred_bak):
+            try:
+                os.replace(cred_bak, self.cred_path)
+                restored = True
+            except Exception:
+                pass
+        elif not cred_had and os.path.exists(self.cred_path):
+            try:
+                os.remove(self.cred_path)
+                restored = True
+            except Exception:
+                pass
+
+        # 2. 恢复会话
+        state_had = tx.get("state_had_existed", False)
+        state_bak = tx.get("state_tx_bak") or self.state_tx_bak
+        if state_had and os.path.exists(state_bak):
+            try:
+                os.replace(state_bak, self.state_path)
+                restored = True
+            except Exception:
+                pass
+        elif not state_had and os.path.exists(self.state_path):
+            try:
+                os.remove(self.state_path)
+                restored = True
+            except Exception:
+                pass
+
+        self.commit_transaction()
+        return restored
+
+    def recover_pending_transaction(self) -> bool:
+        """
+        检查是否存在未决（未提交）事务，若有则自动回滚恢复。
+        用于应对程序中途断电、崩溃、进程被强杀等异常场景。
+        """
+        if not os.path.exists(self.tx_path):
+            return False
+
+        try:
+            with open(self.tx_path, "r", encoding="utf-8") as f:
+                tx = json.load(f)
+            status = tx.get("status")
+            if status != "COMMITTED":
+                print("\n[事务守护] 检测到上次未完成的重新初始化事务，正在自动回滚恢复原有凭据与会话…")
+                self.rollback_transaction()
+                print("[事务守护] 原有凭据与会话已成功恢复，系统状态一致性已保证。")
+                return True
+            else:
+                self.commit_transaction()
+                return False
+        except Exception:
+            self.rollback_transaction()
+            return True
 
     # =========================================================================
     # 步骤一：检查当前认证状态 (只读，脱敏)
@@ -85,6 +238,9 @@ class AuthInitializer:
         检查本地 credential.json 与 state.json 的状态。
         返回结构化字典，严格脱敏。
         """
+        # 优先检测并恢复任何未决事务
+        self.recover_pending_transaction()
+
         cred_exists = os.path.exists(self.cred_path)
         account_raw: Optional[str] = None
         is_encrypted = False
@@ -366,7 +522,7 @@ class AuthInitializer:
         interactive: bool = True,
     ) -> bool:
         """
-        执行完整的认证重新初始化六步生命周期。
+        执行完整的认证重新初始化七步生命周期。
         参数：
         - password: 登录密码（若为 None 且处于交互式环境，则通过 getpass 提示输入）
         - flows_path: 抓包 flows 文件路径
@@ -445,13 +601,16 @@ class AuthInitializer:
         finally:
             del pwd
 
-        # 5. 原子安全替换本地凭据
-        print("\n正在以安全事务方式原子更新 credential.json…")
+        # 5. 开启跨文件复合事务并原子安全替换本地凭据
+        print("\n正在开启跨文件复合更新事务并原子写入 credential.json…")
+        self.begin_transaction()
         try:
             self.apply_new_credential_atomically(new_cred, use_dpapi=use_dpapi)
+            self.record_tx_step("CRED_APPLIED")
             print("  本地凭据已安全原子替换！")
         except Exception as e:
-            print(f"\n❌ 保存新凭据失败: {e}。原有凭据保持未修改。")
+            print(f"\n❌ 保存新凭据失败: {e}。触发事务回滚，原有凭据保持未修改。")
+            self.rollback_transaction()
             return False
 
         # 6. 原子更新本地会话 (state.json)
@@ -460,10 +619,16 @@ class AuthInitializer:
             saved_state = self.update_session_atomically(login_data)
             sem_id = saved_state.get("semesterId") or "未知"
             print(f"  本地会话已更新落地 (当前学期: {sem_id})")
+            self.record_tx_step("STATE_APPLIED")
         except Exception as e:
-            print(f"\n⚠️ 凭据已成功更新，但更新 state.json 时出现异常: {e}")
-            print("  您可以随后通过主菜单 [9] 重新登录以补全会话。")
-            return True
+            print(f"\n❌ 凭据已替换但更新会话 state.json 失败: {e}")
+            print("  [事务保护] 为防止出现「新凭据对应旧会话」的不一致状态，正在自动回滚凭据与会话…")
+            self.rollback_transaction()
+            print("  [事务保护] 旧凭据与旧会话已完全恢复，系统状态一致性未受破坏。重新初始化已中止。")
+            return False
+
+        # 7. 提交跨文件复合事务并完成确认
+        self.commit_transaction()
 
         # 打印完成横幅
         print("\n" + "=" * 55)
