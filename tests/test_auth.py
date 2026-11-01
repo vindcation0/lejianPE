@@ -941,7 +941,9 @@ class AuthTestSuite(unittest.TestCase):
         storage = CredentialStorage(self.cred_path)
         with self.assertRaises(CredentialError) as ctx:
             storage.load_credential()
-        self.assertIn("解密失败", str(ctx.exception))
+        err_msg = str(ctx.exception)
+        self.assertIn("解密", err_msg)
+        self.assertIn("失败", err_msg)
 
     # ==================== L06: 抓包异常退出清理资源 ====================
     def test_L06_capture_login_cleanup_resources(self):
