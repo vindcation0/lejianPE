@@ -13,7 +13,8 @@ import time
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 # 从 libsecurity.so 数据段提取的预置盐
-SECRET = "402881ea7c39c5d5017c39d143a8062b"
+# 乐健 App 逆向硬编码协议常量 (用于 AES 动态密钥派生，非用户私密凭据)
+SECRET = "402881ea7c39c5d5017c39d143a8062b"  # gitleaks:allow
 
 
 def dynamic_key(t) -> bytes:

@@ -35,19 +35,13 @@ from core.credential_storage import (
 from tools.login_envelope import dynamic_key, unwrap, wrap
 
 
+from tests.network_guard import install_network_guard
+
+
 class AuthTestSuite(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import socket
-        cls._orig_socket_connect = socket.socket.connect
-        def guarded_connect(self, address):
-            raise RuntimeError(f"测试隔离屏障触发：单元测试严禁发起外部真实网络连接！目标: {address}")
-        socket.socket.connect = guarded_connect
-
-    @classmethod
-    def tearDownClass(cls):
-        import socket
-        socket.socket.connect = cls._orig_socket_connect
+        install_network_guard()
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="test_auth_")
@@ -660,7 +654,7 @@ class AuthTestSuite(unittest.TestCase):
 
         self.assertEqual(mask_secret(""), "None")
         self.assertEqual(mask_secret("short"), "*** (长度=5)")
-        long_secret = "abcdef1234567890xyz"
+        long_secret = "abcdef1234567890xyz"  # gitleaks:allow
         masked = mask_secret(long_secret)
         self.assertTrue(masked.startswith("abcd...0xyz"))
         self.assertIn("长度=19", masked)

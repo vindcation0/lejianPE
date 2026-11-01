@@ -36,7 +36,7 @@ jobs:
 
       - name: Run test suite
         run: |
-          python -m unittest discover -s tests -v
+          python -m tests.run_tests
         shell: bash
 
   security_scan:
@@ -48,8 +48,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION=8.18.4
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Gitleaks Working Tree Scan
+        run: |
+          echo "Scanning all repository files in current working tree..."
+          gitleaks detect --no-git --source . --verbose --redact
+
+      - name: Gitleaks Full Git History Scan
+        run: |
+          echo "Scanning all commits in full git history..."
+          gitleaks detect --source . --verbose --redact --log-opts="--all"

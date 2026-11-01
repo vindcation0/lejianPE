@@ -74,9 +74,12 @@ def _safe_print(text):
     except UnicodeEncodeError:
         try:
             enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-            print(text.encode(enc, errors="replace").decode(enc))
+            safe_text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+            print(safe_text)
         except Exception:
             pass
+    except Exception:
+        pass
 
 
 def log(msg):

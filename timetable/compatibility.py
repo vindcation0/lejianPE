@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import shutil
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .models import TimeSlot, Timetable
@@ -31,9 +32,12 @@ def _safe_print(text: str):
     except UnicodeEncodeError:
         try:
             enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-            print(text.encode(enc, errors="replace").decode(enc))
+            safe_text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+            print(safe_text)
         except Exception:
             pass
+    except Exception:
+        pass
 
 
 def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
