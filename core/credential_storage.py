@@ -222,8 +222,8 @@ class CredentialStorage:
         if os.path.exists(self.cred_path):
             try:
                 shutil.copy2(self.cred_path, bak_path)
-            except Exception:
-                pass
+            except Exception as e:
+                raise CredentialError(f"备份原有凭据失败: {e}。为防止数据丢失，已拒绝保存！原有凭据未被修改。") from e
 
         try:
             # 1. 写入临时文件

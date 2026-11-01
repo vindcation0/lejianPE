@@ -217,21 +217,33 @@ class AuthManager:
             )
             if status == 200:
                 if isinstance(res, dict):
-                    code = res.get("code")
-                    if code == 0:
-                        sem_d = res.get("data") or {}
-                        sem_id = sem_d.get("id")
-                        year_range = str(sem_d.get("yearRange") or "")
-                        if sem_id:
-                            return sem_id, year_range, None
-                        else:
-                            err_msg = "服务端返回数据缺少 semesterId 字段"
+                    if "_raw" in res and len(res) == 1:
+                        err_msg = "服务端响应不是有效 JSON (HTTP 200)"
                     else:
-                        err_msg = f"服务端业务错误 (code={code}): {res.get('message', '未知错误')}"
+                        code = res.get("code")
+                        if code == 0:
+                            sem_d = res.get("data")
+                            if not sem_d or not isinstance(sem_d, dict):
+                                err_msg = "服务端响应缺少 data 节点或 data 为空"
+                            else:
+                                sem_id = sem_d.get("id")
+                                year_range = str(sem_d.get("yearRange") or "")
+                                if sem_id:
+                                    return str(sem_id).strip(), year_range, None
+                                else:
+                                    err_msg = "服务端返回数据缺少 semesterId 字段"
+                        else:
+                            err_msg = f"服务端业务错误 (code={code}): {res.get('message', '未知错误')}"
                 else:
                     err_msg = "服务端响应格式非法（非 JSON 对象）"
             elif status == 401:
                 err_msg = "HTTP 401 未授权（Token 无效或已过期）"
+            elif status == 403:
+                err_msg = "HTTP 403 禁止访问（权限不足）"
+            elif status == 500:
+                err_msg = "HTTP 500 服务端内部错误"
+            elif status == 502:
+                err_msg = "HTTP 502 网关错误（服务不可用）"
             elif status >= 500:
                 err_msg = f"HTTP {status} 服务端基础设施故障"
             else:
@@ -240,6 +252,10 @@ class AuthManager:
             err_msg = f"网络通信异常: {e}"
         except Exception as e:
             err_msg = f"未知异常: {e}"
+
+        if err_msg and access_token:
+            # 严格脱敏防泄漏
+            err_msg = err_msg.replace(access_token, mask_secret(access_token))
 
         return None, None, err_msg
 
@@ -270,9 +286,15 @@ class AuthManager:
         if not school_id:
             raise SchoolInfoError("保存状态失败：schoolId 缺失")
 
-        # 尝试拉取当前学期 ID
-        sem_id, year_range, sem_err = self.fetch_semester_info(access_token, school_id)
-        final_semester_id = sem_id or login_data.get("semesterId")
+        # 尝试拉取当前学期 ID (若调用方未预先提供有效 semesterId)
+        final_semester_id = login_data.get("semesterId")
+        year_range = str(login_data.get("yearRange") or "")
+        sem_err = None
+        if not final_semester_id:
+            sem_id, fetched_range, sem_err = self.fetch_semester_info(access_token, school_id)
+            final_semester_id = sem_id
+            if fetched_range:
+                year_range = fetched_range
 
         if not final_semester_id:
             detail = f"原因: {sem_err}" if sem_err else "未能获取有效 semesterId"
@@ -308,8 +330,8 @@ class AuthManager:
         if backup and os.path.exists(state_path):
             try:
                 shutil.copy2(state_path, bak_path)
-            except Exception:
-                pass
+            except Exception as e:
+                raise AuthError(f"备份原有会话失败: {e}。为防止旧数据丢失，已拒绝保存！原有会话未被修改。") from e
 
         # 写入临时文件并强校验
         tmp_path = state_path + ".tmp"

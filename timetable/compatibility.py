@@ -25,6 +25,17 @@ def from_schema1_course(c: Dict[str, Any]) -> TimeSlot:
     return TimeSlot(weekday=weekday, start=start, end=end, weeks=weeks)
 
 
+def _safe_print(text: str):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, errors="replace").decode(enc))
+        except Exception:
+            pass
+
+
 def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
     """将旧版完整课表数据转为新版 Timetable 对象并严格执行全量校验"""
     w1 = data.get("week1_monday")
@@ -34,7 +45,7 @@ def from_schema1_dict(data: Dict[str, Any]) -> Timetable:
         today = datetime.date.today()
         monday = today - datetime.timedelta(days=today.weekday())
         w1 = (monday - datetime.timedelta(days=7 * (cw - 1))).isoformat()
-        print(f"[旧版课表兼容] 缺失 week1_monday，基于基准教学周第 {cw} 周及当前日期 {today} 自动推算第一教学周周一为 {w1}")
+        _safe_print(f"[旧版课表兼容] 缺失 week1_monday，基于基准教学周第 {cw} 周及当前日期 {today} 自动推算第一教学周周一为 {w1}")
 
     slots: List[TimeSlot] = []
     raw_courses = data.get("courses")

@@ -68,9 +68,20 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
+def _safe_print(text):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, errors="replace").decode(enc))
+        except Exception:
+            pass
+
+
 def log(msg):
     line = f"[{datetime.datetime.now():%H:%M:%S.%f}"[:-3] + f"] {msg}"
-    print(line)
+    _safe_print(line)
     os.makedirs(LOGS, exist_ok=True)
     p = os.path.join(LOGS, f"run-{datetime.date.today():%Y%m%d}.log")
     with open(p, "a", encoding="utf-8") as f:

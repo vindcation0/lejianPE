@@ -36,6 +36,19 @@ from tools.login_envelope import dynamic_key, unwrap, wrap
 
 
 class AuthTestSuite(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import socket
+        cls._orig_socket_connect = socket.socket.connect
+        def guarded_connect(self, address):
+            raise RuntimeError(f"测试隔离屏障触发：单元测试严禁发起外部真实网络连接！目标: {address}")
+        socket.socket.connect = guarded_connect
+
+    @classmethod
+    def tearDownClass(cls):
+        import socket
+        socket.socket.connect = cls._orig_socket_connect
+
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="test_auth_")
         self.cred_path = os.path.join(self.test_dir, "credential.json")
@@ -689,6 +702,171 @@ class AuthTestSuite(unittest.TestCase):
         self.assertGreater(client_app.expires_in(), 7000)
         self.assertEqual(client_cli.s["schoolId"], client_app.s["schoolId"])
         self.assertEqual(client_cli.s["semesterId"], client_app.s["semesterId"])
+
+    # ==================== A33: 测试隔离屏障验证 (真实网络访问被立即拦截) ====================
+    def test_A33_offline_socket_guard_blocks_real_network(self):
+        import socket
+        s = socket.socket()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                s.connect(("cpes.legym.cn", 443))
+            self.assertIn("测试隔离屏障触发", str(ctx.exception))
+        finally:
+            s.close()
+
+    # ==================== A34: state 备份失败中止并保护旧数据 ====================
+    def test_A34_state_backup_failure_aborts_and_preserves_old(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        old_state = {
+            "accessToken": "old_token_123",
+            "refreshToken": "old_ref_123",
+            "schoolId": "old_sch",
+            "semesterId": "old_sem",
+            "realName": "旧用户",
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(old_state, f)
+
+        new_login = {
+            "accessToken": "new_token_456",
+            "refreshToken": "new_ref_456",
+            "schoolId": "new_sch",
+            "semesterId": "new_sem",
+            "realName": "新用户",
+        }
+
+        with patch("shutil.copy2", side_effect=IOError("模拟备份写入权限受限")):
+            with self.assertRaises(AuthError) as ctx:
+                auth_mgr.save_state_atomically(new_login, self.state_path, backup=True)
+            self.assertIn("备份原有会话失败", str(ctx.exception))
+
+        # 验证原有文件完好无损，且没有临时文件残留
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            curr = json.load(f)
+        self.assertEqual(curr["accessToken"], "old_token_123")
+        self.assertEqual(curr["realName"], "旧用户")
+        self.assertFalse(os.path.exists(self.state_path + ".tmp"))
+
+    # ==================== A35: credential 备份失败中止并保护旧数据 ====================
+    def test_A35_credential_backup_failure_aborts_and_preserves_old(self):
+        storage = CredentialStorage(self.cred_path)
+        storage.save_credential("13800138000", "sig_version_1", "1", use_dpapi=False)
+
+        with patch("shutil.copy2", side_effect=IOError("模拟凭据备份失败")):
+            with self.assertRaises(CredentialError) as ctx:
+                storage.save_credential("13800138000", "sig_version_2", "1", use_dpapi=False)
+            self.assertIn("备份原有凭据失败", str(ctx.exception))
+
+        loaded = storage.load_credential()
+        self.assertEqual(loaded["signDigital"], "sig_version_1")
+        self.assertFalse(os.path.exists(self.cred_path + ".tmp"))
+
+    # ==================== A36: 连续保存保证最新状态与历史备份均完好 ====================
+    def test_A36_consecutive_saves_preserves_backup_and_latest(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        v1 = {"accessToken": "tok_v1", "refreshToken": "ref_v1", "schoolId": "s", "semesterId": "sem1"}
+        v2 = {"accessToken": "tok_v2", "refreshToken": "ref_v2", "schoolId": "s", "semesterId": "sem2"}
+        v3 = {"accessToken": "tok_v3", "refreshToken": "ref_v3", "schoolId": "s", "semesterId": "sem3"}
+
+        auth_mgr.save_state_atomically(v1, self.state_path)
+        auth_mgr.save_state_atomically(v2, self.state_path)
+
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            curr = json.load(f)
+        self.assertEqual(curr["accessToken"], "tok_v2")
+
+        bak_path = self.state_path + ".bak"
+        self.assertTrue(os.path.exists(bak_path))
+        with open(bak_path, "r", encoding="utf-8") as f:
+            bak_data = json.load(f)
+        self.assertEqual(bak_data["accessToken"], "tok_v1")
+
+        auth_mgr.save_state_atomically(v3, self.state_path)
+        with open(self.state_path, "r", encoding="utf-8") as f:
+            curr = json.load(f)
+        self.assertEqual(curr["accessToken"], "tok_v3")
+        with open(bak_path, "r", encoding="utf-8") as f:
+            bak_data = json.load(f)
+        self.assertEqual(bak_data["accessToken"], "tok_v2")
+
+    # ==================== A37: 学期异常矩阵 - HTTP 401 ====================
+    def test_A37_semester_error_matrix_http_401(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", return_value=(401, {"message": "Unauthorized"})):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("401", err)
+            self.assertIn("未授权", err)
+
+    # ==================== A38: 学期异常矩阵 - HTTP 403 ====================
+    def test_A38_semester_error_matrix_http_403(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", return_value=(403, {"message": "Forbidden"})):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("403", err)
+            self.assertIn("禁止访问", err)
+
+    # ==================== A39: 学期异常矩阵 - HTTP 502 ====================
+    def test_A39_semester_error_matrix_http_502(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", return_value=(502, "Bad Gateway")):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("502", err)
+            self.assertIn("网关错误", err)
+
+    # ==================== A40: 学期异常矩阵 - 非法 JSON ====================
+    def test_A40_semester_error_matrix_malformed_json(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", return_value=(200, {"_raw": "<html>500 Error</html>"})):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("不是有效 JSON", err)
+
+    # ==================== A41: 学期异常矩阵 - 响应缺少 data ====================
+    def test_A41_semester_error_matrix_missing_data(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", return_value=(200, {"code": 0, "message": "OK", "data": None})):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("缺少 data", err)
+
+    # ==================== A42: 学期异常矩阵 - data 缺少 semesterId ====================
+    def test_A42_semester_error_matrix_missing_semester_id(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", return_value=(200, {"code": 0, "message": "OK", "data": {"yearRange": "2026-2027"}})):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("缺少 semesterId", err)
+
+    # ==================== A43: 学期异常矩阵 - 网络超时 ====================
+    def test_A43_semester_error_matrix_network_timeout(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", side_effect=AuthNetworkError("请求超时: timed out")):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("网络通信异常", err)
+            self.assertIn("超时", err)
+
+    # ==================== A44: 学期异常矩阵 - 网络连接异常 ====================
+    def test_A44_semester_error_matrix_connection_error(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        with patch.object(auth_mgr, "get_json", side_effect=AuthNetworkError("网络连接异常: [Errno 11001] getaddrinfo failed")):
+            sem_id, yr, err = auth_mgr.fetch_semester_info("mock_tok", "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertIn("网络通信异常", err)
+            self.assertIn("网络连接异常", err)
+
+    # ==================== A45: 学期异常矩阵 - 错误信息严禁泄露 Token ====================
+    def test_A45_semester_error_matrix_token_desensitized(self):
+        auth_mgr = AuthManager(ssl_verify=False)
+        secret_token = "ultra_secret_access_token_123456789"
+        with patch.object(auth_mgr, "get_json", side_effect=AuthNetworkError(f"请求失败包含敏感令牌: {secret_token}")):
+            sem_id, yr, err = auth_mgr.fetch_semester_info(secret_token, "sch_001")
+            self.assertIsNone(sem_id)
+            self.assertNotIn(secret_token, err)
+            self.assertIn("ultr...6789", err)
 
 
 if __name__ == "__main__":
