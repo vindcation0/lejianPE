@@ -106,6 +106,9 @@ class ReportConsistencyTestSuite(unittest.TestCase):
         """R03: 服务端最终对账成功，无未决记录时，正确输出报名数量与成功结论"""
         reconcile_report = {
             "success": True,
+            "status": "SUCCESS",
+            "run_id": "run_p4_001",
+            "complete": True,
             "total_registered": 2,
             "normal_registered": 2,
             "special_registered": 0,
@@ -332,6 +335,9 @@ class ReportConsistencyTestSuite(unittest.TestCase):
         # 最终对账确认成功 2 节（王彤帆、周天一），无未决记录
         reconcile_report = {
             "success": True,
+            "status": "SUCCESS",
+            "run_id": "run_p4_001",
+            "complete": True,
             "total_registered": 2,
             "normal_registered": 2,
             "items": [
@@ -676,6 +682,120 @@ class ReportConsistencyTestSuite(unittest.TestCase):
         )
         status, _ = self.reporter.compute_final_verdict()
         self.assertEqual(status, ReportStatus.UNVERIFIED)
+
+    # ---------------- R26: audit_degraded=True 即使 unpaired_http_requests=0 也必须 UNVERIFIED ----------------
+    def test_R26_audit_degraded_without_unpaired_requests_must_be_unverified(self):
+        """R26: audit_degraded 为 True 时，即使未配对请求为 0，且对账全部成功，最终结论也绝对必须输出 UNVERIFIED"""
+        audit_summary = {
+            "run_id": "run_p4_001",
+            "audit_degraded": True,
+            "unpaired_http_requests": 0,
+            "http_requests_total": 5,
+            "http_requests_succeeded": 5,
+            "http_requests_failed": 0
+        }
+        self.reporter.set_audit_summary(audit_summary)
+
+        reconcile_report = {
+            "success": True,
+            "status": "SUCCESS",
+            "run_id": "run_p4_001",
+            "complete": True,
+            "total_registered": 1,
+            "items": [{"id": "act_r26", "name": "羽毛球", "isRegister": True}]
+        }
+        self.reporter.set_reconciliation_result(
+            reconciled_items=reconcile_report["items"],
+            reconciliation_report=reconcile_report
+        )
+
+        status, desc = self.reporter.compute_final_verdict()
+        self.assertEqual(status, ReportStatus.UNVERIFIED, "audit_degraded=True 时绝对禁止输出 SUCCESS")
+        self.assertIn("审计数据不完整或发生降级", desc)
+
+    # ---------------- R27: write_error_count>0 即使对账 SUCCESS 也必须 UNVERIFIED ----------------
+    def test_R27_write_error_count_prevents_success_verdict(self):
+        """R27: write_error_count > 0 时，说明关键事件写入丢失，即使最终对账成功，也不能输出 SUCCESS，必须为 UNVERIFIED"""
+        mock_audit = MagicMock()
+        mock_audit.run_id = "run_p4_001"
+        mock_audit.write_error_count = 1
+        self.reporter.bind_audit_logger(mock_audit)
+
+        reconcile_report = {
+            "success": True,
+            "status": "SUCCESS",
+            "run_id": "run_p4_001",
+            "complete": True,
+            "total_registered": 2,
+            "items": [{"id": "act_r27_1", "isRegister": True}, {"id": "act_r27_2", "isRegister": True}]
+        }
+        self.reporter.set_reconciliation_result(
+            reconciled_items=reconcile_report["items"],
+            reconciliation_report=reconcile_report
+        )
+
+        status, desc = self.reporter.compute_final_verdict()
+        self.assertEqual(status, ReportStatus.UNVERIFIED, "日志写入异常时绝对禁止判定 SUCCESS")
+        self.assertIn("审计日志写入失败 1 次", desc)
+
+    # ---------------- R28: reconciliation_run_id 缺失必须 UNVERIFIED ----------------
+    def test_R28_missing_reconciliation_run_id_outputs_unverified(self):
+        """R28: 对账报告缺失 run_id 时，无法确认对账时效性与归属，必须输出 UNVERIFIED"""
+        reconcile_report = {
+            "success": True,
+            "status": "SUCCESS",
+            "complete": True,
+            # run_id 缺失
+            "items": [{"id": "act_r28", "isRegister": True}]
+        }
+        self.reporter.set_reconciliation_result(
+            reconciled_items=reconcile_report["items"],
+            reconciliation_report=reconcile_report
+        )
+
+        status, desc = self.reporter.compute_final_verdict()
+        self.assertEqual(status, ReportStatus.UNVERIFIED)
+        self.assertIn("最终服务端对账报告缺失 run_id", desc)
+
+    # ---------------- R29: reporter.run_id 缺失必须 UNVERIFIED ----------------
+    def test_R29_missing_reporter_run_id_outputs_unverified(self):
+        """R29: 当前 reporter.run_id 为空或缺失时，无法校验对账归属，必须输出 UNVERIFIED"""
+        anonymous_reporter = ResultReporter(run_date=datetime.date(2026, 11, 8), run_id=None)
+        reconcile_report = {
+            "success": True,
+            "status": "SUCCESS",
+            "run_id": "run_p4_001",
+            "complete": True,
+            "items": [{"id": "act_r29", "isRegister": True}]
+        }
+        anonymous_reporter.set_reconciliation_result(
+            reconciled_items=reconcile_report["items"],
+            reconciliation_report=reconcile_report
+        )
+
+        status, desc = anonymous_reporter.compute_final_verdict()
+        self.assertEqual(status, ReportStatus.UNVERIFIED)
+        self.assertIn("当前结果报告缺失运行编号", desc)
+
+    # ---------------- R30: 对账报告使用历史 run_id 必须 UNVERIFIED ----------------
+    def test_R30_stale_historical_reconciliation_run_id_outputs_unverified(self):
+        """R30: 对账报告来自历史旧 run_id 时，即使对账成功，也必须判定为 UNVERIFIED"""
+        current_reporter = ResultReporter(run_date=datetime.date(2026, 11, 8), run_id="run_current_today_888")
+        stale_report = {
+            "success": True,
+            "status": "SUCCESS",
+            "run_id": "run_historical_yesterday_111",
+            "complete": True,
+            "items": [{"id": "act_r30", "isRegister": True}]
+        }
+        current_reporter.set_reconciliation_result(
+            reconciled_items=stale_report["items"],
+            reconciliation_report=stale_report
+        )
+
+        status, desc = current_reporter.compute_final_verdict()
+        self.assertEqual(status, ReportStatus.UNVERIFIED)
+        self.assertIn("不匹配", desc)
 
 
 if __name__ == "__main__":

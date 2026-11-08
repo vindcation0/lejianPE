@@ -356,13 +356,14 @@ class ResultReporter:
                 f"存在 {total_uncertain} 节状态未决的报名请求 (SUBMITTING/UNKNOWN/VERIFYING)，无法确认真实落地结果，安全屏障已阻断后续提交！"
             )
 
-        # 2. 对账未执行、对账失败或对账列表数据残缺或非 SUCCESS
+        # 2. 对账未执行、对账失败、数据残缺、run_id 缺失或不匹配 (任务二)
         if not self.reconciliation_performed:
             return (
                 ReportStatus.UNVERIFIED,
                 "未执行最终全局服务端对账，无法确认实际报名状态。"
             )
 
+        # 检查对账状态必须明确为 SUCCESS 且完整
         if not self.reconciliation_success or self.reconciliation_status != "SUCCESS":
             err_msg = self.reconciliation_error or "对账未完成或状态异常"
             return (
@@ -376,21 +377,41 @@ class ResultReporter:
                 "最终服务端对账数据不完整 (complete=False)，标记为未确认！"
             )
 
-        # 检查对账报告的 run_id 是否匹配当前 run_id (防跨 run 污染 R21)
-        if self.run_id and getattr(self, "reconciliation_run_id", None):
-            if str(self.reconciliation_run_id) != str(self.run_id):
-                return (
-                    ReportStatus.UNVERIFIED,
-                    f"对账报告来源 (run_id={self.reconciliation_run_id}) 与当前运行编号 ({self.run_id}) 不匹配，判定为未确认！"
-                )
+        # 检查当前 reporter.run_id 是否存在 (R29)
+        if not self.run_id or not str(self.run_id).strip():
+            return (
+                ReportStatus.UNVERIFIED,
+                "当前结果报告缺失运行编号 (run_id)，无法确认对账归属性！"
+            )
 
-        # 3. 审计日志降级且有关键未配对事件
-        if self.audit_degraded and (self.write_error_count > 0 or self.unpaired_http_requests > 0):
+        # 检查 reconciliation_report.run_id 是否存在 (R28)
+        reconcile_rid = getattr(self, "reconciliation_run_id", None)
+        if not reconcile_rid or not str(reconcile_rid).strip():
+            return (
+                ReportStatus.UNVERIFIED,
+                "最终服务端对账报告缺失 run_id，无法确认对账时效性与归属性！"
+            )
+
+        # 检查两者是否完全一致 (R30)
+        if str(reconcile_rid).strip() != str(self.run_id).strip():
+            return (
+                ReportStatus.UNVERIFIED,
+                f"对账报告来源 (run_id={reconcile_rid}) 与当前运行编号 ({self.run_id}) 不匹配，判定为未确认！"
+            )
+
+        # 3. 审计日志降级、写入错误或未配对请求 (任务一: R26, R27)
+        if self.audit_degraded or self.write_error_count > 0 or self.unpaired_http_requests > 0:
+            reasons = []
+            if self.write_error_count > 0:
+                reasons.append(f"审计日志写入失败 {self.write_error_count} 次")
             if self.unpaired_http_requests > 0:
-                return (
-                    ReportStatus.UNVERIFIED,
-                    f"审计事件存在 {self.unpaired_http_requests} 个未配对 HTTP 请求，底层审计数据不完整！"
-                )
+                reasons.append(f"存在 {self.unpaired_http_requests} 个未配对 HTTP 请求")
+            if self.audit_degraded and not reasons:
+                reasons.append("检测到审计降级标记 (audit_degraded=True)")
+            return (
+                ReportStatus.UNVERIFIED,
+                f"关键审计数据不完整或发生降级 ({'；'.join(reasons)})，无法确保统计 100% 准确，判定为未确认！"
+            )
 
         # 4. 对账通过后的业务结果判定
         if self.reconciled_success > 0:
