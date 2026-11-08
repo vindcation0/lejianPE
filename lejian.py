@@ -1126,7 +1126,7 @@ def _cmd_grab_inner(cfg, st, lock=None):
             res_ok, res_status, res_msg, remote_item = reg_mgr.resolve_unknown(unres_aid, unres_name)
             if res_status == RegistrationStatus.SUCCESS:
                 log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认报名成功！")
-                reporter.record_attempt(unres_aid, unres_name, "SUCCESS", "复核确认成功")
+                reporter.record_verification(unres_aid, unres_name, "SUCCESS", "复核确认已报名")
                 it_for_quota = remote_item or next((x for x in items if str(x.get("id")) == str(unres_aid)), None) or target_unres
                 if isinstance(it_for_quota, dict) and "startTime" in it_for_quota:
                     try:
@@ -1144,9 +1144,10 @@ def _cmd_grab_inner(cfg, st, lock=None):
                         pass
             elif res_status == RegistrationStatus.RETRYABLE:
                 log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认未报名，释放潜在名额占用。")
-                reporter.record_attempt(unres_aid, unres_name, "FAILED", "复核确认未报名")
+                reporter.record_verification(unres_aid, unres_name, "RETRYABLE", "复核明确确认未报名")
             else:
                 log(f"  [安全屏障保持] 未决活动 {unres_name} 暂无法确认真实状态，继续保持队列冻结。")
+                reporter.record_verification(unres_aid, unres_name, "UNKNOWN", "复核无法确认状态，保持冻结")
                 time.sleep(poll)
                 continue
 

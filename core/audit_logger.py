@@ -301,7 +301,7 @@ class AuditLogReader:
     """审计日志解析与事件统计回放器"""
 
     @staticmethod
-    def parse_line(line: str) -> Optional[Dict]:
+    def parse_line(line: str, line_no: Optional[int] = None) -> Optional[Dict]:
         """解析单行 JSONL 审计事件，兼容 Schema v1 与旧版格式"""
         raw = line.strip()
         if not raw:
@@ -318,18 +318,44 @@ class AuditLogReader:
                 return data
 
             # 若为旧版事件格式: {"t": "...", "event": "...", ...}
-            legacy_evt = data.get("event") or "legacy_event"
+            legacy_evt = str(data.get("event") or "legacy_event")
             legacy_t = data.get("t") or datetime.datetime.now().isoformat()
             legacy_http = data.get("http") or data.get("http_status")
+            evt_id = data.get("event_id") or (f"legacy_{line_no}_{abs(hash(raw))}" if line_no is not None else f"legacy_{abs(hash(raw))}")
+
+            # 精准语义映射：严格区分 Verification、Infrastructure、Submission 与 Conflict
+            if legacy_evt.startswith("resolve_unknown") or "verify" in legacy_evt:
+                legacy_type = EventType.VERIFICATION
+                if legacy_evt == "resolve_unknown_not_registered":
+                    mapped_name = EventName.VERIFICATION_CONFIRMED_UNREGISTERED
+                elif legacy_evt == "resolve_unknown_success":
+                    mapped_name = EventName.VERIFICATION_CONFIRMED_REGISTERED
+                elif legacy_evt == "resolve_unknown_failed":
+                    mapped_name = EventName.VERIFICATION_REMAINS_UNKNOWN
+                else:
+                    mapped_name = legacy_evt
+            elif legacy_evt in ("list_fail", "list_fault_started") or ("fail" in legacy_evt and "list" in legacy_evt):
+                legacy_type = EventType.INFRASTRUCTURE
+                mapped_name = legacy_evt
+            elif legacy_evt in ("list_ok", "infrastructure_recovered") or ("ok" in legacy_evt and "list" in legacy_evt):
+                legacy_type = EventType.INFRASTRUCTURE
+                mapped_name = legacy_evt
+            elif "conflict" in legacy_evt:
+                legacy_type = EventType.CONFLICT
+                mapped_name = legacy_evt
+            else:
+                legacy_type = EventType.SUBMISSION
+                mapped_name = legacy_evt
+
             return {
                 "schema_version": 0,
-                "event_id": data.get("event_id") or f"legacy_{hash(raw)}",
+                "event_id": evt_id,
                 "run_id": data.get("run_id") or "legacy_run",
                 "correlation_id": data.get("correlation_id") or data.get("event_id") or "legacy_corr",
                 "request_id": data.get("request_id"),
                 "timestamp": legacy_t,
-                "event_type": EventType.INFRASTRUCTURE if ("fail" in legacy_evt or "list" in legacy_evt) else EventType.SUBMISSION,
-                "event_name": legacy_evt,
+                "event_type": legacy_type,
+                "event_name": mapped_name,
                 "activity_id": str(data.get("activity_id") or data.get("aid") or "") or None,
                 "status": data.get("status"),
                 "reason": data.get("reason"),
@@ -350,14 +376,21 @@ class AuditLogReader:
             return []
         events = []
         with open(file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                parsed = cls.parse_line(line)
+            for idx, line in enumerate(f):
+                parsed = cls.parse_line(line, line_no=idx)
                 if parsed:
                     events.append(parsed)
         return events
 
     @classmethod
-    def replay(cls, events: List[Dict], run_id: Optional[str] = None, log_dir: Optional[str] = None) -> Dict[str, Any]:
+    def replay(
+        cls,
+        events: List[Dict],
+        run_id: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         基于事件日志的幂等统计回放：
         1. 基于 event_id 去重，重复处理绝不产生二次计数（A13）；
@@ -373,6 +406,13 @@ class AuditLogReader:
                 if eid in seen_event_ids:
                     continue
                 seen_event_ids.add(eid)
+            # 时间窗口过滤 (ISO 8601 字符串比较，精准限制历史会话)
+            evt_ts = evt.get("timestamp") or evt.get("t")
+            if evt_ts:
+                if start_time and evt_ts < start_time:
+                    continue
+                if end_time and evt_ts > end_time:
+                    continue
             # 若过滤特定 run_id
             if run_id and evt.get("run_id") != run_id:
                 continue
@@ -425,6 +465,7 @@ class AuditLogReader:
         conflict_check_succeeded_count = 0
         conflict_check_failed_count = 0
         conflict_check_degraded_count = 0
+        conflict_failures_by_code = collections.Counter()
         local_conflict_check_started_count = 0
         local_conflict_check_succeeded_count = 0
         local_conflict_detected_count = 0
@@ -519,18 +560,37 @@ class AuditLogReader:
                 elif ename in (EventName.HTTP_REQUEST_FAILED, "list_fail"):
                     http_requests_failed += 1
                     if code is not None:
-                        http_failures_by_code[int(code)] += 1
+                        try:
+                            http_failures_by_code[int(code)] += 1
+                        except Exception:
+                            pass
+                elif ename == "list_fault_started":
+                    # 若同一事件集中未记录底层 http_request_failed，由 list_fault_started 作为事实来源；
+                    # 若底层已有 http_request_failed，则视为状态切换标记，防同一故障双重计数 (A13)
+                    if http_requests_total == 0:
+                        http_requests_failed += 1
+                        if code is not None:
+                            try:
+                                http_failures_by_code[int(code)] += 1
+                            except Exception:
+                                pass
                 elif ename == EventName.CIRCUIT_OPEN:
                     circuit_trips += 1
                 elif ename == EventName.CIRCUIT_HALF_OPEN:
                     circuit_half_open_count += 1
-                elif ename in (EventName.CIRCUIT_CLOSED, EventName.INFRASTRUCTURE_RECOVERED, "list_ok"):
+                elif ename in (EventName.CIRCUIT_CLOSED, EventName.INFRASTRUCTURE_RECOVERED, "list_ok", "infrastructure_recovered"):
                     circuit_closed_count += 1
                     det = evt.get("details") or {}
-                    outage_sec = det.get("outage_sec") or det.get("outage_seconds")
+                    outage_sec = det.get("outage_sec") or det.get("outage_seconds") or evt.get("outage_sec") or evt.get("outage_seconds")
                     if outage_sec is not None:
                         try:
                             outage_seconds_accumulated += float(outage_sec)
+                        except Exception:
+                            pass
+                    elif det.get("duration_ms") is not None or evt.get("duration_ms") is not None:
+                        try:
+                            ms_val = float(det.get("duration_ms") if det.get("duration_ms") is not None else evt.get("duration_ms"))
+                            outage_seconds_accumulated += (ms_val / 1000.0)
                         except Exception:
                             pass
 
@@ -541,6 +601,11 @@ class AuditLogReader:
                 conflict_check_succeeded_count += 1
             elif ename == EventName.CONFLICT_CHECK_FAILED:
                 conflict_check_failed_count += 1
+                if code is not None:
+                    try:
+                        conflict_failures_by_code[int(code)] += 1
+                    except Exception:
+                        pass
             elif ename == EventName.CONFLICT_CHECK_DEGRADED:
                 conflict_check_degraded_count += 1
             elif ename == EventName.LOCAL_CONFLICT_CHECK_STARTED:
@@ -612,6 +677,7 @@ class AuditLogReader:
             "conflict_check_succeeded_count": conflict_check_succeeded_count,
             "conflict_check_failed_count": conflict_check_failed_count,
             "conflict_check_degraded_count": conflict_check_degraded_count,
+            "conflict_failures_by_code": dict(conflict_failures_by_code),
             "local_conflict_check_started_count": local_conflict_check_started_count,
             "local_conflict_check_succeeded_count": local_conflict_check_succeeded_count,
             "local_conflict_detected_count": local_conflict_detected_count,
