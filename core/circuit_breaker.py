@@ -7,7 +7,7 @@
 """
 import random
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 class CircuitState:
@@ -55,12 +55,14 @@ class CircuitBreaker:
         failure_threshold: int = 3,
         base_cooldown: float = 2.0,
         max_cooldown: float = 30.0,
-        jitter_max: float = 0.5
+        jitter_max: float = 0.5,
+        audit_logger: Optional[Any] = None
     ):
         self.failure_threshold = failure_threshold
         self.base_cooldown = base_cooldown
         self.max_cooldown = max_cooldown
         self.jitter_max = jitter_max
+        self.audit_logger = audit_logger
 
         self.state = CircuitState.CLOSED
         self.failure_count = 0
@@ -176,6 +178,23 @@ class CircuitBreaker:
         jitter = random.uniform(0, self.jitter_max)
         self.current_cooldown = round(backoff + jitter, 2)
 
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="infrastructure",
+                    event_name="circuit_open",
+                    status="OPEN",
+                    reason=reason or f"连续故障达到阈值 ({self.failure_count}/{self.failure_threshold})",
+                    source="circuit_breaker",
+                    details={
+                        "trip_count": self.trip_count,
+                        "failure_count": self.failure_count,
+                        "cooldown_sec": self.current_cooldown
+                    }
+                )
+            except Exception:
+                pass
+
     def _transition_to_half_open(self):
         """进入半开状态 HALF_OPEN"""
         now = time.time()
@@ -184,6 +203,17 @@ class CircuitBreaker:
             self._last_open_start = 0.0
         self.state = CircuitState.HALF_OPEN
         self._half_open_probe_in_progress = False
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="infrastructure",
+                    event_name="circuit_half_open",
+                    status="HALF_OPEN",
+                    reason="冷却期结束，进入半开探测",
+                    source="circuit_breaker"
+                )
+            except Exception:
+                pass
 
     def _transition_to_closed(self):
         """恢复正常状态 CLOSED"""
@@ -194,6 +224,17 @@ class CircuitBreaker:
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self._half_open_probe_in_progress = False
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="infrastructure",
+                    event_name="circuit_closed",
+                    status="CLOSED",
+                    reason="半开探测成功，熔断器恢复正常",
+                    source="circuit_breaker"
+                )
+            except Exception:
+                pass
 
     def get_remaining_cooldown(self) -> float:
         """获取当前 OPEN 状态剩余冷却秒数"""

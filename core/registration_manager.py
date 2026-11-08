@@ -44,9 +44,19 @@ class RegistrationManager:
         """
         aid = str(item.get("id"))
         name = (item.get("name") or "").replace("\n", " ").strip()
+        correlation_id = f"corr_{aid}_{int(datetime.datetime.now().timestamp()*1000)}"
 
         # ---------------- 0. UNKNOWN 安全屏障：全局单未决请求互斥 (U12) ----------------
         if self.state_store.has_unresolved(exclude_activity_id=aid):
+            if hasattr(self.audit_logger, "record_event"):
+                self.audit_logger.record_event(
+                    event_type="candidate",
+                    event_name="candidate_rejected",
+                    activity_id=aid,
+                    reason=f"存在其他未决报名请求，安全屏障已冻结队列: {name}",
+                    source="registration_manager",
+                    correlation_id=correlation_id
+                )
             return False, RegistrationStatus.UNKNOWN, f"存在其他未决报名请求，安全屏障已冻结队列，禁止提交新候选: {name}", item
 
         # ---------------- 1. 本地状态检查与冲突前置拦截 ----------------
@@ -58,7 +68,7 @@ class RegistrationManager:
 
             if st in (RegistrationStatus.SUBMITTING, RegistrationStatus.UNKNOWN, RegistrationStatus.VERIFYING):
                 # 状态不明确，必须先向服务端求证真实状态
-                verified, is_reg, remote_item = self.req_mgr.verify_registration(aid)
+                verified, is_reg, remote_item = self.req_mgr.verify_registration(aid, correlation_id=correlation_id)
                 if verified:
                     if is_reg:
                         self.state_store.record_success(aid, name, http_status=200)
@@ -86,6 +96,15 @@ class RegistrationManager:
         if validate_rules_cb:
             ok, reason = validate_rules_cb(item)
             if not ok:
+                if hasattr(self.audit_logger, "record_event"):
+                    self.audit_logger.record_event(
+                        event_type="candidate",
+                        event_name="candidate_rejected",
+                        activity_id=aid,
+                        reason=f"规则校验未通过: {reason}",
+                        source="registration_manager",
+                        correlation_id=correlation_id
+                    )
                 return False, RegistrationStatus.FAILED, f"规则校验未通过: {reason}", item
 
         # ---------------- 3. 提交前持久化 SUBMITTING (原子预留防 TOCTOU) ----------------
@@ -94,6 +113,15 @@ class RegistrationManager:
         try:
             ok_res, cur_rec, res_err = self.state_store.reserve_submitting(aid, name)
             if not ok_res:
+                if hasattr(self.audit_logger, "record_event"):
+                    self.audit_logger.record_event(
+                        event_type="candidate",
+                        event_name="candidate_rejected",
+                        activity_id=aid,
+                        reason=f"安全屏障互斥生效: {res_err}",
+                        source="registration_manager",
+                        correlation_id=correlation_id
+                    )
                 return False, RegistrationStatus.UNKNOWN, f"安全屏障互斥生效，禁止并发提交: {res_err}", item
             if cur_rec:
                 attempts = cur_rec.get("attempts", 1)
@@ -102,13 +130,50 @@ class RegistrationManager:
             return False, RegistrationStatus.FAILED, f"状态库持久化失败，拒绝提交以避免不可逆状态: {e}", item
 
         # ---------------- 4. 提交一次请求 ----------------
+        if hasattr(self.audit_logger, "record_event"):
+            self.audit_logger.record_event(
+                event_type="submission",
+                event_name="submission_started",
+                activity_id=aid,
+                status="SUBMITTING",
+                source="registration_manager",
+                correlation_id=correlation_id,
+                details={"attempts": attempts, "name": name}
+            )
+
         res = self.req_mgr.submit_once("education/app/activity/signUp", {"activityId": aid})
         t_end = datetime.datetime.now()
+        dur_ms = round((t_end - t_start).total_seconds() * 1000, 2)
+
+        if hasattr(self.audit_logger, "record_event"):
+            self.audit_logger.record_event(
+                event_type="submission",
+                event_name="submission_response_received",
+                activity_id=aid,
+                status=res.classification,
+                http_status=res.http_status,
+                duration_ms=dur_ms,
+                source="registration_manager",
+                correlation_id=correlation_id,
+                reason=res.reason
+            )
 
         # ---------------- 5. 结果评估与复核闭环 ----------------
         # 5.1 明确业务成功
         if res.classification == "SUCCESS":
             self.state_store.record_success(aid, name, http_status=res.http_status)
+            if hasattr(self.audit_logger, "record_event"):
+                self.audit_logger.record_event(
+                    event_type="submission",
+                    event_name="submission_succeeded",
+                    activity_id=aid,
+                    status="SUCCESS",
+                    http_status=res.http_status,
+                    duration_ms=dur_ms,
+                    source="registration_manager",
+                    correlation_id=correlation_id,
+                    reason=res.reason
+                )
             self.audit_logger.log_request(
                 activity_id=aid,
                 activity_name=name,
@@ -127,6 +192,18 @@ class RegistrationManager:
         # 5.2 明确业务失败（名额已满、已达上限等）
         if res.classification == "FAILED":
             self.state_store.record_failed(aid, name, error=res.reason, http_status=res.http_status)
+            if hasattr(self.audit_logger, "record_event"):
+                self.audit_logger.record_event(
+                    event_type="submission",
+                    event_name="submission_failed",
+                    activity_id=aid,
+                    status="FAILED",
+                    http_status=res.http_status,
+                    duration_ms=dur_ms,
+                    source="registration_manager",
+                    correlation_id=correlation_id,
+                    reason=res.reason
+                )
             self.audit_logger.log_request(
                 activity_id=aid,
                 activity_name=name,
@@ -145,10 +222,22 @@ class RegistrationManager:
 
         # 5.3 结果未知 (HTTP 500, 502, 503, 超时, 未明响应等)
         # 必须先置为 UNKNOWN，再进行服务端状态复核
+        if hasattr(self.audit_logger, "record_event"):
+            self.audit_logger.record_event(
+                event_type="submission",
+                event_name="submission_unknown",
+                activity_id=aid,
+                status="UNKNOWN",
+                http_status=res.http_status,
+                duration_ms=dur_ms,
+                source="registration_manager",
+                correlation_id=correlation_id,
+                reason=res.reason or res.error
+            )
         self.state_store.record_unknown(aid, name, error=res.reason or res.error or "", http_status=res.http_status)
         self.state_store.record_verifying(aid)
 
-        verified, is_reg, remote_item = self.req_mgr.verify_registration(aid)
+        verified, is_reg, remote_item = self.req_mgr.verify_registration(aid, correlation_id=correlation_id)
         if verified:
             if is_reg:
                 # 提交虽然报异常，但服务端实际上已经落库成功！
@@ -205,7 +294,7 @@ class RegistrationManager:
             )
             return False, RegistrationStatus.UNKNOWN, f"提交异常且无法复核状态({res.reason})，保持 UNKNOWN", item
 
-    def resolve_unknown(self, activity_id: str, activity_name: str = "") -> Tuple[bool, str, str, Optional[Dict]]:
+    def resolve_unknown(self, activity_id: str, activity_name: str = "", correlation_id: Optional[str] = None) -> Tuple[bool, str, str, Optional[Dict]]:
         """
         对已处于 UNKNOWN / VERIFYING 的未决活动执行一次只读状态复核。
         返回: (is_success: bool, final_status: str, reason: str, remote_item: Optional[Dict])
@@ -220,17 +309,53 @@ class RegistrationManager:
             name = rec.get("activity_name", "") if rec else ""
 
         self.state_store.record_verifying(aid)
-        verified, is_reg, remote_item = self.req_mgr.verify_registration(aid)
+        if hasattr(self.audit_logger, "record_event"):
+            self.audit_logger.record_event(
+                event_type="verification",
+                event_name="verification_started",
+                activity_id=aid,
+                source="registration_manager",
+                correlation_id=correlation_id
+            )
+
+        verified, is_reg, remote_item = self.req_mgr.verify_registration(aid, correlation_id=correlation_id)
         if verified:
             if is_reg:
                 self.state_store.record_success(aid, name, http_status=200)
+                if hasattr(self.audit_logger, "record_event"):
+                    self.audit_logger.record_event(
+                        event_type="verification",
+                        event_name="verification_confirmed_registered",
+                        activity_id=aid,
+                        status="SUCCESS",
+                        source="registration_manager",
+                        correlation_id=correlation_id
+                    )
                 self.audit_logger.log_event("resolve_unknown_success", {"aid": aid, "name": name})
                 return True, RegistrationStatus.SUCCESS, f"复核确认已成功: {name}", remote_item
             else:
                 self.state_store.record_retryable(aid, "复核明确确认未报名")
+                if hasattr(self.audit_logger, "record_event"):
+                    self.audit_logger.record_event(
+                        event_type="verification",
+                        event_name="verification_confirmed_unregistered",
+                        activity_id=aid,
+                        status="RETRYABLE",
+                        source="registration_manager",
+                        correlation_id=correlation_id
+                    )
                 self.audit_logger.log_event("resolve_unknown_not_registered", {"aid": aid, "name": name})
                 return False, RegistrationStatus.RETRYABLE, f"复核明确确认未报名: {name}", remote_item
         else:
             self.state_store.record_unknown(aid, name, "复核失败或列表不完整，保持 UNKNOWN")
+            if hasattr(self.audit_logger, "record_event"):
+                self.audit_logger.record_event(
+                    event_type="verification",
+                    event_name="verification_remains_unknown",
+                    activity_id=aid,
+                    status="UNKNOWN",
+                    source="registration_manager",
+                    correlation_id=correlation_id
+                )
             self.audit_logger.log_event("resolve_unknown_failed", {"aid": aid, "name": name})
             return False, RegistrationStatus.UNKNOWN, f"复核失败或列表不完整，保持 UNKNOWN: {name}", None

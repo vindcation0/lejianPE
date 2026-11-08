@@ -113,7 +113,19 @@ def log(msg):
 
 # ---------------------------------------------------------------- HTTP
 def _request(method, path, params=None, body=None, form=False, auth=True,
-             token=None, school_id=None, timeout=15):
+             token=None, school_id=None, timeout=15, audit_logger=None):
+    t_start = time.time()
+    if audit_logger and hasattr(audit_logger, "record_event"):
+        try:
+            audit_logger.record_event(
+                event_type="infrastructure",
+                event_name="http_request_started",
+                source="client_http",
+                details={"method": method, "path": path}
+            )
+        except Exception:
+            pass
+
     url = path if path.startswith("http") else BASE + path
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
@@ -131,13 +143,42 @@ def _request(method, path, params=None, body=None, form=False, auth=True,
         headers["Organization"] = school_id or ""
 
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    status_code = -1
+    resp_text = ""
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
-            return r.status, dec(r.read())
+            status_code, resp_text = r.status, dec(r.read())
     except urllib.error.HTTPError as e:
-        return e.code, dec(e.read())
+        status_code, resp_text = e.code, dec(e.read())
     except Exception as e:
-        return -1, repr(e)
+        status_code, resp_text = -1, repr(e)
+
+    dur_ms = round((time.time() - t_start) * 1000, 2)
+    if audit_logger and hasattr(audit_logger, "record_event"):
+        try:
+            if status_code == 200:
+                audit_logger.record_event(
+                    event_type="infrastructure",
+                    event_name="http_request_succeeded",
+                    http_status=200,
+                    duration_ms=dur_ms,
+                    source="client_http",
+                    details={"method": method, "path": path}
+                )
+            else:
+                audit_logger.record_event(
+                    event_type="infrastructure",
+                    event_name="http_request_failed",
+                    http_status=status_code,
+                    duration_ms=dur_ms,
+                    reason=resp_text[:200] if isinstance(resp_text, str) else repr(resp_text)[:200],
+                    source="client_http",
+                    details={"method": method, "path": path}
+                )
+        except Exception:
+            pass
+
+    return status_code, resp_text
 
 
 class ActivityList(list):
@@ -169,8 +210,9 @@ class ActivityList(list):
 
 
 class Client:
-    def __init__(self, state):
+    def __init__(self, state, audit_logger=None):
         self.s = state
+        self.audit_logger = audit_logger
         self._refresh_lock = threading.RLock()
 
     def expires_in(self):
@@ -185,7 +227,7 @@ class Client:
             if not rt:
                 raise RuntimeError("state.json 缺 refreshToken，请在 App 里重新登录后跑 tools/make_state.py")
             code, text = _request("GET", "authorization/user/refreshToken",
-                                  params={"refreshToken": rt}, auth=False)
+                                  params={"refreshToken": rt}, auth=False, audit_logger=self.audit_logger)
             try:
                 obj = json.loads(text)
             except Exception as e:
@@ -234,12 +276,14 @@ class Client:
     def post(self, path, body, timeout=15):
         self.ensure_token()
         return _request("POST", path, body=body, timeout=timeout,
-                        token=self.s["accessToken"], school_id=self.s["schoolId"])
+                        token=self.s["accessToken"], school_id=self.s["schoolId"],
+                        audit_logger=self.audit_logger)
 
     def get(self, path, params=None, timeout=15):
         self.ensure_token()
         return _request("GET", path, params=params, timeout=timeout,
-                        token=self.s["accessToken"], school_id=self.s["schoolId"])
+                        token=self.s["accessToken"], school_id=self.s["schoolId"],
+                        audit_logger=self.audit_logger)
 
     def call(self, method, path, body=None, timeout=15):
         code, text = (self.post(path, body, timeout) if method == "POST"
@@ -256,16 +300,28 @@ class Client:
             self._last_fail = code
             self._fail_since = datetime.datetime.now()
             log(f"  [列表异常] HTTP {code}，开始记录")
-            try:
-                line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
-                                   "event": "list_fail", "http": code},
-                                  ensure_ascii=False)
-                os.makedirs(LOGS, exist_ok=True)
-                with open(os.path.join(LOGS, f"events-{datetime.date.today():%Y%m%d}.jsonl"),
-                          "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception:
-                pass
+            if self.audit_logger and hasattr(self.audit_logger, "record_event"):
+                try:
+                    self.audit_logger.record_event(
+                        event_type="infrastructure",
+                        event_name="list_fault_started",
+                        http_status=code,
+                        source="client_list",
+                        details={"event": "list_fail", "http": code}
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
+                                       "event": "list_fail", "http": code},
+                                      ensure_ascii=False)
+                    os.makedirs(LOGS, exist_ok=True)
+                    with open(os.path.join(LOGS, f"events-{datetime.date.today():%Y%m%d}.jsonl"),
+                              "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except Exception:
+                    pass
 
     def _note_ok(self):
         if getattr(self, "_last_fail", None) is not None:
@@ -273,15 +329,26 @@ class Client:
             dur = (datetime.datetime.now() - since).total_seconds() if since else 0
             log(f"  [列表恢复] 中断约 {dur:.0f} 秒")
             self._last_fail = None
-            try:
-                line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
-                                   "event": "list_ok", "outage_sec": round(dur)},
-                                  ensure_ascii=False)
-                with open(os.path.join(LOGS, f"events-{datetime.date.today():%Y%m%d}.jsonl"),
-                          "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception:
-                pass
+            if self.audit_logger and hasattr(self.audit_logger, "record_event"):
+                try:
+                    self.audit_logger.record_event(
+                        event_type="infrastructure",
+                        event_name="infrastructure_recovered",
+                        source="client_list",
+                        details={"event": "list_ok", "outage_sec": round(dur)}
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    line = json.dumps({"t": datetime.datetime.now().isoformat(timespec="seconds"),
+                                       "event": "list_ok", "outage_sec": round(dur)},
+                                      ensure_ascii=False)
+                    with open(os.path.join(LOGS, f"events-{datetime.date.today():%Y%m%d}.jsonl"),
+                              "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except Exception:
+                    pass
 
     def activities(self, page_size=200, req_timeout=6, max_retries=0, max_attempts=None):
         """
@@ -744,9 +811,19 @@ def cmd_grab():
 
 
 def _cmd_grab_inner(cfg, st):
-    c = Client(st)
     test_mode = "test" in sys.argv[2:]
     now_mode = "now" in sys.argv[2:]
+
+    # 初始化可靠性系统与统一审计日志
+    state_store = StateStore(DB_PATH)
+    audit_logger = AuditLogger(LOGS)
+    c = Client(st, audit_logger=audit_logger)
+    retry_policy = RetryPolicy(base_delay=0.5, max_delay=8.0)
+    circuit_breaker = CircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0, audit_logger=audit_logger)
+    reporter = ResultReporter(run_date=datetime.date.today())
+    req_mgr = RequestManager(c, retry_policy, audit_logger=audit_logger)
+    reg_mgr = RegistrationManager(state_store, req_mgr, audit_logger)
+    recovery_mgr = RecoveryManager(state_store, req_mgr, audit_logger)
 
     try:
         c.ensure_token()
@@ -755,16 +832,6 @@ def _cmd_grab_inner(cfg, st):
         if not test_mode:
             log("请先重新登录或同步有效 Token (使用 tools/resync_from_app.py 或 tools/make_state.py)！")
             return
-
-    # 初始化可靠性系统
-    state_store = StateStore(DB_PATH)
-    audit_logger = AuditLogger(LOGS)
-    retry_policy = RetryPolicy(base_delay=0.5, max_delay=8.0)
-    circuit_breaker = CircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0)
-    reporter = ResultReporter(run_date=datetime.date.today())
-    req_mgr = RequestManager(c, retry_policy)
-    reg_mgr = RegistrationManager(state_store, req_mgr, audit_logger)
-    recovery_mgr = RecoveryManager(state_store, req_mgr, audit_logger)
 
     # 1. 启动对账与异常恢复
     log("正在执行启动状态对账与未决记录恢复…")
@@ -1071,7 +1138,7 @@ def _cmd_grab_inner(cfg, st):
         time.sleep(poll)
 
     # 抢课循环结束或满额时执行最终全局对账与报告输出
-    reconciler = ReconciliationManager(c, cfg, tt, week_of)
+    reconciler = ReconciliationManager(c, cfg, tt, week_of, audit_logger=audit_logger)
     report = reconciler.reconcile()
     unresolved_cnt = len(state_store.get_unresolved_records())
     cb_metrics = circuit_breaker.get_metrics()

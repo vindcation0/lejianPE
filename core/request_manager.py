@@ -38,9 +38,10 @@ class SubmitResult:
 class RequestManager:
     """请求管理器"""
 
-    def __init__(self, client: Any, retry_policy: Any = None):
+    def __init__(self, client: Any, retry_policy: Any = None, audit_logger: Optional[Any] = None):
         self.client = client
         self.retry_policy = retry_policy
+        self.audit_logger = audit_logger
 
     def request_query(
         self,
@@ -236,7 +237,8 @@ class RequestManager:
     def verify_registration(
         self,
         activity_id: str,
-        timeout: int = 6
+        timeout: int = 6,
+        correlation_id: Optional[str] = None
     ) -> Tuple[bool, Optional[bool], Optional[Dict]]:
         """
         通过查询接口获取活动列表，核实 target activity 是否已报名 (isRegister)。
@@ -255,18 +257,81 @@ class RequestManager:
            - 列表中未检索到目标活动（可能下架、不可见或分页截断）；
            - 返回数据结构异常或为空。
         """
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="verification",
+                    event_name="verification_started",
+                    activity_id=str(activity_id),
+                    source="request_manager",
+                    correlation_id=correlation_id
+                )
+            except Exception:
+                pass
+
         try:
             # 使用 client 的 activities 拉取最新列表（默认 max_retries=0，单次请求无隐式重试）
             items = self.client.activities(page_size=200, req_timeout=timeout)
-        except Exception:
+        except Exception as e:
+            if self.audit_logger:
+                try:
+                    self.audit_logger.record_event(
+                        event_type="verification",
+                        event_name="verification_request_failed",
+                        activity_id=str(activity_id),
+                        reason=str(e),
+                        source="request_manager",
+                        correlation_id=correlation_id
+                    )
+                except Exception:
+                    pass
             return False, None, None
 
         if not items or not isinstance(items, list):
+            if self.audit_logger:
+                try:
+                    self.audit_logger.record_event(
+                        event_type="verification",
+                        event_name="verification_remains_unknown",
+                        activity_id=str(activity_id),
+                        status="UNKNOWN",
+                        reason="复核列表为空或格式异常",
+                        source="request_manager",
+                        correlation_id=correlation_id
+                    )
+                except Exception:
+                    pass
             return False, None, None
+
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="verification",
+                    event_name="verification_request_succeeded",
+                    activity_id=str(activity_id),
+                    source="request_manager",
+                    correlation_id=correlation_id
+                )
+            except Exception:
+                pass
 
         # 检查 HTTP 状态码（若存在非 200 则直接判定未确认）
         http_code = getattr(items, "http_code", None)
         if http_code is not None and http_code != 200:
+            if self.audit_logger:
+                try:
+                    self.audit_logger.record_event(
+                        event_type="verification",
+                        event_name="verification_remains_unknown",
+                        activity_id=str(activity_id),
+                        status="UNKNOWN",
+                        http_status=http_code,
+                        reason=f"复核列表 HTTP 状态码非 200 ({http_code})",
+                        source="request_manager",
+                        correlation_id=correlation_id
+                    )
+                except Exception:
+                    pass
             return False, None, None
 
         # 检查分页完整性标记（若是 ActivityList 且 complete=False 则为残缺）
@@ -279,11 +344,61 @@ class RequestManager:
                 is_reg = bool(it.get("isRegister"))
                 if is_reg:
                     # 只要明确确认已在服务端报名，即使分页后续未完也能确认成功
+                    if self.audit_logger:
+                        try:
+                            self.audit_logger.record_event(
+                                event_type="verification",
+                                event_name="verification_confirmed_registered",
+                                activity_id=str(activity_id),
+                                status="SUCCESS",
+                                source="request_manager",
+                                correlation_id=correlation_id
+                            )
+                        except Exception:
+                            pass
                     return True, True, it
                 # 确认未报名必须满足：数据完全完整且无截断
                 if not is_complete:
+                    if self.audit_logger:
+                        try:
+                            self.audit_logger.record_event(
+                                event_type="verification",
+                                event_name="verification_remains_unknown",
+                                activity_id=str(activity_id),
+                                status="UNKNOWN",
+                                reason="确认未报名需要完整列表，但当前分页数据被截断",
+                                source="request_manager",
+                                correlation_id=correlation_id
+                            )
+                        except Exception:
+                            pass
                     return False, None, None
+                if self.audit_logger:
+                    try:
+                        self.audit_logger.record_event(
+                            event_type="verification",
+                            event_name="verification_confirmed_unregistered",
+                            activity_id=str(activity_id),
+                            status="RETRYABLE",
+                            source="request_manager",
+                            correlation_id=correlation_id
+                        )
+                    except Exception:
+                        pass
                 return True, False, it
 
         # 列表中未检索到该活动（数据不全或已下架），严禁轻率断定为未报名
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="verification",
+                    event_name="verification_remains_unknown",
+                    activity_id=str(activity_id),
+                    status="UNKNOWN",
+                    reason="列表中未检索到目标活动",
+                    source="request_manager",
+                    correlation_id=correlation_id
+                )
+            except Exception:
+                pass
         return False, None, None

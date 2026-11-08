@@ -15,17 +15,28 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 class ReconciliationManager:
     """报名结果核对器"""
 
-    def __init__(self, client: Any, cfg: Dict, timetable: Dict, week_calc_fn: Callable):
+    def __init__(self, client: Any, cfg: Dict, timetable: Dict, week_calc_fn: Callable, audit_logger: Optional[Any] = None):
         self.client = client
         self.cfg = cfg
         self.timetable = timetable
         self.week_calc_fn = week_calc_fn
+        self.audit_logger = audit_logger
 
     def reconcile(self) -> Dict[str, Any]:
         """
         拉取最新活动列表，核对当前所有教学周的实际报名状态。
         返回对账报告字典。
         """
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="reconciliation",
+                    event_name="reconciliation_started",
+                    source="reconciliation"
+                )
+            except Exception:
+                pass
+
         max_normal = int(self.cfg.get("max_normal", 2))
         max_per_day = int(self.cfg.get("max_per_day", 1))
         special_keywords = self.cfg.get("special") or []
@@ -33,6 +44,16 @@ class ReconciliationManager:
         try:
             items = self.client.activities(page_size=200, req_timeout=6)
         except Exception as e:
+            if self.audit_logger:
+                try:
+                    self.audit_logger.record_event(
+                        event_type="reconciliation",
+                        event_name="reconciliation_failed",
+                        reason=f"拉取对账列表失败: {e}",
+                        source="reconciliation"
+                    )
+                except Exception:
+                    pass
             return {
                 "success": False,
                 "error": f"拉取对账列表失败: {e}",
@@ -68,9 +89,21 @@ class ReconciliationManager:
             }
 
         if not is_complete:
+            err_msg = f"对账列表不完整（仅获取 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，{getattr(items, 'error', '')}），对账中止"
+            if self.audit_logger:
+                try:
+                    self.audit_logger.record_event(
+                        event_type="reconciliation",
+                        event_name="reconciliation_incomplete",
+                        reason=err_msg,
+                        source="reconciliation",
+                        details={"fetched": getattr(items, 'fetched', len(items)), "total": getattr(items, 'total', 0)}
+                    )
+                except Exception:
+                    pass
             return {
                 "success": False,
-                "error": f"对账列表不完整（仅获取 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，{getattr(items, 'error', '')}），对账中止",
+                "error": err_msg,
                 "registered": [],
                 "exceeded": False
             }
@@ -129,5 +162,21 @@ class ReconciliationManager:
             "exceeded_days": {str(d): len(acts) for d, acts in exceeded_days.items()},
             "items": registered_items
         }
+
+        if self.audit_logger:
+            try:
+                self.audit_logger.record_event(
+                    event_type="reconciliation",
+                    event_name="reconciliation_succeeded",
+                    source="reconciliation",
+                    details={
+                        "total_registered": len(registered_items),
+                        "normal_registered": len(normal_items),
+                        "special_registered": len(special_items),
+                        "exceeded": has_exceeded
+                    }
+                )
+            except Exception:
+                pass
 
         return report
