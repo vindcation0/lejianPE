@@ -15,18 +15,29 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 class ReconciliationManager:
     """报名结果核对器"""
 
-    def __init__(self, client: Any, cfg: Dict, timetable: Dict, week_calc_fn: Callable, audit_logger: Optional[Any] = None):
+    def __init__(
+        self,
+        client: Any,
+        cfg: Dict,
+        timetable: Dict,
+        week_calc_fn: Callable,
+        audit_logger: Optional[Any] = None,
+        state_store: Optional[Any] = None
+    ):
         self.client = client
         self.cfg = cfg
         self.timetable = timetable
         self.week_calc_fn = week_calc_fn
         self.audit_logger = audit_logger
+        self.state_store = state_store
 
-    def reconcile(self) -> Dict[str, Any]:
+    def reconcile(self, state_store: Optional[Any] = None) -> Dict[str, Any]:
         """
         拉取最新活动列表，核对当前所有教学周的实际报名状态。
-        返回对账报告字典。
+        返回对账报告字典，并在对账成功且数据完整时同步解除 UNKNOWN 状态。
         """
+        active_store = state_store or self.state_store
+        run_id = getattr(self.audit_logger, "run_id", None) if self.audit_logger else None
         if self.audit_logger:
             try:
                 self.audit_logger.record_event(
@@ -56,6 +67,9 @@ class ReconciliationManager:
                     pass
             return {
                 "success": False,
+                "status": "FAILED",
+                "run_id": run_id,
+                "complete": False,
                 "error": f"拉取对账列表失败: {e}",
                 "registered": [],
                 "exceeded": False
@@ -68,8 +82,11 @@ class ReconciliationManager:
         if not items:
             # 区分合法完整的空列表与非正常空数据
             if is_complete and total_cnt == 0:
-                return {
+                report = {
                     "success": True,
+                    "status": "SUCCESS",
+                    "run_id": run_id,
+                    "complete": True,
                     "total_registered": 0,
                     "normal_registered": 0,
                     "special_registered": 0,
@@ -81,8 +98,21 @@ class ReconciliationManager:
                     "items": [],
                     "unparsed_items": []
                 }
+                # 若存在未决记录，在完整空列表下同步为 RETRYABLE
+                if active_store is not None:
+                    try:
+                        for rec in active_store.get_unresolved_records():
+                            aid = str(rec.get("activity_id"))
+                            active_store.record_retryable(aid, "最终全局对账确认服务端未报名(空列表)")
+                    except Exception:
+                        pass
+                return report
+
             return {
                 "success": False,
+                "status": "UNVERIFIED",
+                "run_id": run_id,
+                "complete": False,
                 "error": f"活动列表为空或未通过完整性验证 (complete={is_complete}, total={total_cnt})",
                 "registered": [],
                 "exceeded": False
@@ -103,6 +133,9 @@ class ReconciliationManager:
                     pass
             return {
                 "success": False,
+                "status": "UNVERIFIED",
+                "run_id": run_id,
+                "complete": False,
                 "error": err_msg,
                 "registered": [],
                 "exceeded": False
@@ -150,6 +183,9 @@ class ReconciliationManager:
 
         report = {
             "success": True,
+            "status": "SUCCESS",
+            "run_id": run_id,
+            "complete": True,
             "total_registered": len(registered_items),
             "normal_registered": len(normal_items),
             "special_registered": len(special_items),
@@ -162,6 +198,48 @@ class ReconciliationManager:
             "exceeded_days": {str(d): len(acts) for d, acts in exceeded_days.items()},
             "items": registered_items
         }
+
+        # 全局对账成功且列表完整时，同步解除 StateStore 中的 UNKNOWN 状态
+        if active_store is not None:
+            try:
+                registered_ids = {str(it.get("id")) for it in registered_items if it.get("id")}
+                unresolved_records = active_store.get_unresolved_records()
+                for rec in unresolved_records:
+                    aid = str(rec.get("activity_id"))
+                    act_name = rec.get("activity_name") or ""
+                    if aid in registered_ids:
+                        # 服务端确认存在该活动的有效报名：解除 UNKNOWN 并更新为 SUCCESS
+                        active_store.record_success(aid, act_name, http_status=200)
+                        if self.audit_logger and hasattr(self.audit_logger, "record_event"):
+                            self.audit_logger.record_event(
+                                event_type="verification",
+                                event_name="verification_confirmed_registered",
+                                activity_id=aid,
+                                status="SUCCESS",
+                                source="reconciliation",
+                                details={"reason": "最终全局对账识别到服务端已报名"}
+                            )
+                    else:
+                        # 仅在列表完整时才确认未报名并解除为 RETRYABLE
+                        if is_complete:
+                            active_store.record_retryable(aid, "最终全局对账确认服务端未报名")
+                            if self.audit_logger and hasattr(self.audit_logger, "record_event"):
+                                self.audit_logger.record_event(
+                                    event_type="verification",
+                                    event_name="verification_confirmed_unregistered",
+                                    activity_id=aid,
+                                    status="RETRYABLE",
+                                    source="reconciliation",
+                                    details={"reason": "最终全局对账确认服务端未报名"}
+                                )
+            except Exception as e:
+                if self.audit_logger and hasattr(self.audit_logger, "record_event"):
+                    self.audit_logger.record_event(
+                        event_type="reconciliation",
+                        event_name="reconciliation_failed",
+                        reason=f"对账同步状态库异常: {e}",
+                        source="reconciliation"
+                    )
 
         if self.audit_logger:
             try:

@@ -1149,7 +1149,7 @@ def _cmd_grab_inner(cfg, st):
         time.sleep(poll)
 
     # 抢课循环结束或满额时执行最终全局对账与报告输出
-    reconciler = ReconciliationManager(c, cfg, tt, week_of, audit_logger=audit_logger)
+    reconciler = ReconciliationManager(c, cfg, tt, week_of, audit_logger=audit_logger, state_store=state_store)
     report = reconciler.reconcile()
     unresolved_cnt = len(state_store.get_unresolved_records())
     cb_metrics = circuit_breaker.get_metrics()

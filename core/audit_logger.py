@@ -21,6 +21,8 @@ import sys
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 class EventType:
     """审计事件五大分类"""
@@ -114,6 +116,17 @@ class AuditLogger:
     def _get_event_path(self, date_str: str) -> str:
         return os.path.join(self.logs_dir, f"events-{date_str}.jsonl")
 
+    def _mark_run_degraded(self, run_id: Optional[str]):
+        """在日志目录中持久化标记降级状态，防进程崩溃后丢失降级信息"""
+        if not run_id:
+            return
+        try:
+            marker_path = os.path.join(self.logs_dir, f".degraded_{run_id}")
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write(f"degraded at {datetime.datetime.now().isoformat()}\n")
+        except Exception:
+            pass
+
     def record_event(
         self,
         event_type: str,
@@ -169,6 +182,7 @@ class AuditLogger:
                 f.write(line + "\n")
         except Exception as e:
             self.write_error_count += 1
+            self._mark_run_degraded(self.run_id)
             # 写入失败必须有明确处理和警告日志，绝不抛出未经捕获的异常打断主业务流程
             print(f"[警告] 写入审计事件日志失败 (event_id={evt_id}): {e}", file=sys.stderr)
 
@@ -252,6 +266,7 @@ class AuditLogger:
                 f.write(line + "\n")
         except Exception as e:
             self.write_error_count += 1
+            self._mark_run_degraded(self.run_id)
             print(f"[警告] 写入请求审计日志失败: {e}", file=sys.stderr)
 
         return record
@@ -317,7 +332,7 @@ class AuditLogReader:
         return events
 
     @classmethod
-    def replay(cls, events: List[Dict], run_id: Optional[str] = None) -> Dict[str, Any]:
+    def replay(cls, events: List[Dict], run_id: Optional[str] = None, log_dir: Optional[str] = None) -> Dict[str, Any]:
         """
         基于事件日志的幂等统计回放：
         1. 基于 event_id 去重，重复处理绝不产生二次计数（A13）；
@@ -487,6 +502,13 @@ class AuditLogReader:
         http_avg_duration_ms = round(sum(http_durations) / len(http_durations), 2) if http_durations else 0.0
         verification_avg_duration_ms = round(sum(verification_durations) / len(verification_durations), 2) if verification_durations else 0.0
 
+        marker_degraded = False
+        target_dir = log_dir or os.path.join(ROOT, "logs")
+        if run_id and os.path.isdir(target_dir):
+            marker_file = os.path.join(target_dir, f".degraded_{run_id}")
+            if os.path.exists(marker_file):
+                marker_degraded = True
+
         return {
             "total_events": len(deduped_events),
             "distinct_event_ids": len(seen_event_ids),
@@ -523,7 +545,7 @@ class AuditLogReader:
             "network_error_count": sum(cnt for c, cnt in http_failures_by_code.items() if c < 0 or c >= 500),
             # Request ID & Audit Integrity
             "unpaired_http_requests": unpaired_http_requests,
-            "audit_degraded": bool(unpaired_http_requests > 0),
+            "audit_degraded": bool(unpaired_http_requests > 0 or marker_degraded),
             # Circuit breaker
             "circuit_trips": circuit_trips,
             "circuit_half_open_count": circuit_half_open_count,

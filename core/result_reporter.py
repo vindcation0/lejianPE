@@ -76,10 +76,14 @@ class ResultReporter:
         self.reconciliation_success = False
         self.reconciliation_status = "UNVERIFIED"  # SUCCESS, FAILED, UNVERIFIED
         self.reconciliation_error: Optional[str] = None
+        self.reconciliation_run_id: Optional[str] = None
+        self.reconciliation_complete: bool = True
         self.reconciled_items: List[Dict] = []
         self.reconciled_success = 0
         self.reconciled_failed = 0
         self.unresolved_count = 0
+        self.uncertain_count = 0
+        self.pending_retry_count = 0
         self.historical_count = 0
         self.total_server_registered = 0
         self.by_week_distribution: Dict[str, Any] = {}
@@ -197,28 +201,52 @@ class ResultReporter:
         weekly_exceeded: bool = False,
         daily_exceeded: bool = False,
         reconciliation_report: Optional[Dict] = None,
-        success: Optional[bool] = None
+        success: Optional[bool] = None,
+        uncertain_count: Optional[int] = None,
+        pending_retry_count: Optional[int] = None
     ):
         """记录最终服务端对账结果（支持旧签名与新结构化报表）"""
         self.reconciliation_performed = True
 
         if reconciliation_report is not None:
+            self.reconciliation_run_id = reconciliation_report.get("run_id")
             is_succ = bool(reconciliation_report.get("success", False))
-            self.reconciliation_success = is_succ
-            self.reconciliation_status = "SUCCESS" if is_succ else "UNVERIFIED"
+            is_comp = bool(reconciliation_report.get("complete", True))
+            self.reconciliation_complete = is_comp
+            status_val = reconciliation_report.get("status")
+            if status_val == "SUCCESS" and is_succ and is_comp:
+                self.reconciliation_status = "SUCCESS"
+                self.reconciliation_success = True
+            elif status_val is None and is_succ and is_comp and ("status" not in reconciliation_report):
+                # 若报告未提供 status 字段但显式 success=True 且完整，缺省为 SUCCESS
+                self.reconciliation_status = "SUCCESS"
+                self.reconciliation_success = True
+            else:
+                self.reconciliation_status = status_val
+                self.reconciliation_success = False
             self.reconciliation_error = reconciliation_report.get("error")
             self.by_week_distribution = reconciliation_report.get("by_week") or {}
             self.by_day_distribution = reconciliation_report.get("by_day") or {}
             items = reconciliation_report.get("items") or reconciled_items or []
         else:
             is_succ = True if success is None else bool(success)
+            self.reconciliation_complete = True
             self.reconciliation_success = is_succ
             self.reconciliation_status = "SUCCESS" if is_succ else "UNVERIFIED"
             items = reconciled_items or []
 
         self.reconciled_items = list(items)
         self.total_server_registered = len(self.reconciled_items)
-        self.unresolved_count = unresolved_count
+
+        if uncertain_count is not None:
+            self.uncertain_count = max(self.uncertain_count, uncertain_count)
+        elif unresolved_count > 0:
+            self.uncertain_count = max(self.uncertain_count, unresolved_count)
+
+        if pending_retry_count is not None:
+            self.pending_retry_count = max(self.pending_retry_count, pending_retry_count)
+
+        self.unresolved_count = self.uncertain_count
 
         # 区分本轮尝试确认成功与既有已报
         attempted_ids = {str(r.get("activity_id")) for r in self.attempt_records if r.get("activity_id")}
@@ -233,7 +261,7 @@ class ResultReporter:
             self.reconciled_success = len(self.reconciled_items)
 
         # 确认未成功数量 = 总提交尝试 - 本轮确认成功 - 仍未解决
-        self.reconciled_failed = max(0, self.attempts_total - self.reconciled_success - self.unresolved_count)
+        self.reconciled_failed = max(0, self.attempts_total - self.reconciled_success - self.uncertain_count)
 
         self.normal_registered = normal_registered
         self.max_normal = max_normal
@@ -243,24 +271,24 @@ class ResultReporter:
         self.daily_limit_exceeded = daily_exceeded
 
     def set_local_state_store(self, state_store: Any):
-        """从 StateStore 加载当前持久化未决状态"""
+        """从 StateStore 加载当前持久化未决状态 (SUBMITTING/UNKNOWN/VERIFYING) 与待重试状态 (RETRYABLE)"""
         if state_store is None:
             return
         try:
-            unresolved = state_store.get_unresolved_records()
-            self.local_unresolved_records = list(unresolved)
-            self.unresolved_count = max(self.unresolved_count, len(unresolved))
+            all_records = state_store.get_all_records()
+            self.local_submitting_count = sum(1 for r in all_records if (r.get("status") or "").upper() == "SUBMITTING")
+            self.local_unknown_count = sum(1 for r in all_records if (r.get("status") or "").upper() == "UNKNOWN")
+            self.local_verifying_count = sum(1 for r in all_records if (r.get("status") or "").upper() == "VERIFYING")
+            self.local_retryable_count = sum(1 for r in all_records if (r.get("status") or "").upper() == "RETRYABLE")
 
-            for r in unresolved:
-                st = (r.get("status") or "").upper()
-                if st == "SUBMITTING":
-                    self.local_submitting_count += 1
-                elif st == "UNKNOWN":
-                    self.local_unknown_count += 1
-                elif st == "VERIFYING":
-                    self.local_verifying_count += 1
-                elif st == "RETRYABLE":
-                    self.local_retryable_count += 1
+            self.uncertain_count = self.local_submitting_count + self.local_unknown_count + self.local_verifying_count
+            self.pending_retry_count = self.local_retryable_count
+            self.unresolved_count = self.uncertain_count
+
+            # local_unresolved_records 仅保留真正未决记录 (SUBMITTING, UNKNOWN, VERIFYING)
+            self.local_unresolved_records = [
+                r for r in all_records if (r.get("status") or "").upper() in ("SUBMITTING", "UNKNOWN", "VERIFYING")
+            ]
         except Exception:
             pass
 
@@ -303,21 +331,32 @@ class ResultReporter:
 
     def compute_final_verdict(self) -> Tuple[str, str]:
         """
-        根据 Phase 4 规定的状态优先级决策树判定最终结论：
-        1. 存在未决请求 (unresolved_count > 0) 或对账未成功 -> 必须输出 UNVERIFIED！
-        2. 对账完全成功且无未决记录时：
-           - 成功报名数 > 0 且无明确失败 -> SUCCESS
-           - 成功报名数 > 0 但有部分失败或未满额 -> PARTIAL_SUCCESS
-           - 成功报名数 == 0 -> FAILED
+        根据 Phase 4 最终封版规范的四状态优先级决策树判定最终结论：
+        1. uncertain_count > 0 (SUBMITTING / UNKNOWN / VERIFYING) -> 必须输出 UNVERIFIED！
+        2. 对账未执行、对账失败、数据不完整、run_id 不匹配或状态非 SUCCESS -> 必须输出 UNVERIFIED！
+        3. 审计严重降级 (未配对 HTTP 请求) -> 必须输出 UNVERIFIED！
+        4. 对账完全成功且无 uncertain 记录时：
+           - pending_retry_count > 0：禁止 SUCCESS！
+             - 若成功报名数 > 0 -> PARTIAL_SUCCESS
+             - 若成功报名数 == 0 -> FAILED
+           - 若无 pending_retry：
+             - 成功报名数 > 0 且无超额与失败 -> SUCCESS
+             - 成功报名数 > 0 但有部分失败或超额 -> PARTIAL_SUCCESS
+             - 成功报名数 == 0 -> FAILED
         """
-        # 1. 存在未决请求，必须优先判定为 UNVERIFIED
-        if self.unresolved_count > 0 or self.local_unknown_count > 0:
+        # 1. 存在未决不确定请求 (SUBMITTING / UNKNOWN / VERIFYING)，必须优先判定为 UNVERIFIED
+        total_uncertain = max(
+            self.uncertain_count,
+            self.local_unknown_count + self.local_submitting_count + self.local_verifying_count,
+            self.unresolved_count
+        )
+        if total_uncertain > 0:
             return (
                 ReportStatus.UNVERIFIED,
-                f"存在 {self.unresolved_count} 节状态未决的报名请求，无法确认真实落地结果，安全屏障已阻断后续提交！"
+                f"存在 {total_uncertain} 节状态未决的报名请求 (SUBMITTING/UNKNOWN/VERIFYING)，无法确认真实落地结果，安全屏障已阻断后续提交！"
             )
 
-        # 2. 对账未执行、对账失败或对账列表数据残缺
+        # 2. 对账未执行、对账失败或对账列表数据残缺或非 SUCCESS
         if not self.reconciliation_performed:
             return (
                 ReportStatus.UNVERIFIED,
@@ -325,11 +364,25 @@ class ResultReporter:
             )
 
         if not self.reconciliation_success or self.reconciliation_status != "SUCCESS":
-            err_msg = self.reconciliation_error or "对账列表残缺或网络异常"
+            err_msg = self.reconciliation_error or "对账未完成或状态异常"
             return (
                 ReportStatus.UNVERIFIED,
                 f"最终服务端对账未通过 ({err_msg})，严禁将空列表解释为零报名，标记为未确认！"
             )
+
+        if getattr(self, "reconciliation_complete", True) is False:
+            return (
+                ReportStatus.UNVERIFIED,
+                "最终服务端对账数据不完整 (complete=False)，标记为未确认！"
+            )
+
+        # 检查对账报告的 run_id 是否匹配当前 run_id (防跨 run 污染 R21)
+        if self.run_id and getattr(self, "reconciliation_run_id", None):
+            if str(self.reconciliation_run_id) != str(self.run_id):
+                return (
+                    ReportStatus.UNVERIFIED,
+                    f"对账报告来源 (run_id={self.reconciliation_run_id}) 与当前运行编号 ({self.run_id}) 不匹配，判定为未确认！"
+                )
 
         # 3. 审计日志降级且有关键未配对事件
         if self.audit_degraded and (self.write_error_count > 0 or self.unpaired_http_requests > 0):
@@ -346,6 +399,11 @@ class ResultReporter:
                     ReportStatus.PARTIAL_SUCCESS,
                     f"成功报名 {self.reconciled_success} 节，但检测到已超出配额限制（需人工核实退课）！"
                 )
+            if self.pending_retry_count > 0:
+                return (
+                    ReportStatus.PARTIAL_SUCCESS,
+                    f"成功报名 {self.reconciled_success} 节，但仍有 {self.pending_retry_count} 节活动处于待重试 (RETRYABLE) 状态未达成目标。"
+                )
             if self.explicit_failed > 0 or self.reconciled_failed > 0:
                 return (
                     ReportStatus.PARTIAL_SUCCESS,
@@ -357,6 +415,12 @@ class ResultReporter:
             )
 
         # 成功数 == 0
+        if self.pending_retry_count > 0:
+            return (
+                ReportStatus.FAILED,
+                f"本轮未成功报名任何活动（存在 {self.pending_retry_count} 节 RETRYABLE 活动但未达成报名）。"
+            )
+
         return (
             ReportStatus.FAILED,
             "本轮未成功报名任何活动（明确失败或名额已满）。"
@@ -419,6 +483,9 @@ class ResultReporter:
                 "confirmed_success": self.reconciled_success,
                 "confirmed_failed": self.reconciled_failed,
                 "unresolved": self.unresolved_count,
+                "uncertain_count": self.uncertain_count,
+                "pending_retry_count": self.pending_retry_count,
+                "complete": self.reconciliation_complete,
                 "historical_count": self.historical_count,
                 "total_server_registered": self.total_server_registered,
                 "by_week": dict(self.by_week_distribution),
@@ -464,7 +531,9 @@ class ResultReporter:
                 "unknown_count": self.local_unknown_count or self.unresolved_count,
                 "verifying_count": self.local_verifying_count,
                 "retryable_count": self.local_retryable_count,
-                "has_unresolved": self.unresolved_count > 0 or self.local_unknown_count > 0,
+                "uncertain_count": self.uncertain_count,
+                "pending_retry_count": self.pending_retry_count,
+                "has_unresolved": self.uncertain_count > 0 or self.local_unknown_count > 0,
                 "has_write_errors": self.write_error_count > 0,
                 "reconciliation_failed": not self.reconciliation_success if self.reconciliation_performed else True
             },
