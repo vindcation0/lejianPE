@@ -47,20 +47,23 @@ class RegistrationManager:
         correlation_id = f"corr_{aid}_{int(datetime.datetime.now().timestamp()*1000)}"
 
         # ---------------- 0. UNKNOWN 安全屏障：全局单未决请求互斥 (U12) ----------------
-        if self.state_store.has_unresolved(exclude_activity_id=aid):
-            if hasattr(self.audit_logger, "record_event"):
-                self.audit_logger.record_event(
-                    event_type="candidate",
-                    event_name="candidate_rejected",
-                    activity_id=aid,
-                    reason=f"存在其他未决报名请求，安全屏障已冻结队列: {name}",
-                    source="registration_manager",
-                    correlation_id=correlation_id
-                )
-            return False, RegistrationStatus.UNKNOWN, f"存在其他未决报名请求，安全屏障已冻结队列，禁止提交新候选: {name}", item
+        try:
+            if self.state_store.has_unresolved(exclude_activity_id=aid):
+                if hasattr(self.audit_logger, "record_event"):
+                    self.audit_logger.record_event(
+                        event_type="candidate",
+                        event_name="candidate_rejected",
+                        activity_id=aid,
+                        reason=f"存在其他未决报名请求，安全屏障已冻结队列: {name}",
+                        source="registration_manager",
+                        correlation_id=correlation_id
+                    )
+                return False, RegistrationStatus.UNKNOWN, f"存在其他未决报名请求，安全屏障已冻结队列，禁止提交新候选: {name}", item
 
-        # ---------------- 1. 本地状态检查与冲突前置拦截 ----------------
-        rec = self.state_store.get_record(aid)
+            # ---------------- 1. 本地状态检查与冲突前置拦截 ----------------
+            rec = self.state_store.get_record(aid)
+        except StateStoreError as e:
+            return False, RegistrationStatus.FAILED, f"状态库持久化失败，拒绝提交以避免不可逆状态: {e}", item
         if rec:
             st = rec.get("status")
             if st == RegistrationStatus.SUCCESS:

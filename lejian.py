@@ -898,12 +898,12 @@ def cmd_grab():
         return
 
     try:
-        _cmd_grab_inner(cfg, st)
+        _cmd_grab_inner(cfg, st, lock=lock)
     finally:
         lock.release()
 
 
-def _cmd_grab_inner(cfg, st):
+def _cmd_grab_inner(cfg, st, lock=None):
     test_mode = "test" in sys.argv[2:]
     now_mode = "now" in sys.argv[2:]
 
@@ -998,6 +998,7 @@ def _cmd_grab_inner(cfg, st):
         activities_breaker=circuit_breaker,
         conflict_breaker=conflict_breaker,
         local_checker=local_conflict_checker,
+        instance_lock=lock,
         lock_path=LOCK_PATH,
         run_id=audit_logger.run_id
     )

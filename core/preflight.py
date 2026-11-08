@@ -55,10 +55,13 @@ class PreflightStatus:
 
 
 class PreflightMode:
-    """Preflight 启动运行模式枚举"""
-    SERVER_MODE = "SERVER_MODE"
-    LOCAL_FALLBACK = "LOCAL_FALLBACK"
-    BLOCKED = "BLOCKED"
+    """Preflight 启动运行模式枚举 (Phase 7 F01 细化)"""
+    SERVER_MODE = "SERVER_MODE"          # activities NORMAL + checkConflict NORMAL (READY)
+    LOCAL_CONFLICT = "LOCAL_CONFLICT"    # activities NORMAL + checkConflict OPEN (DEGRADED_READY)
+    LOCAL_FALLBACK = "LOCAL_CONFLICT"    # 兼容别名
+    ACTIVITY_CACHE = "ACTIVITY_CACHE"    # activities OPEN + 有效缓存 (DEGRADED_READY)
+    DEGRADED_FULL = "DEGRADED_FULL"      # 两者均 OPEN + 有效缓存 (DEGRADED_READY)
+    BLOCKED = "BLOCKED"                  # 关键安全检查失败 (BLOCKED)
 
 
 class CheckItemStatus:
@@ -394,29 +397,48 @@ class PreflightChecker:
         act_breaker_state = getattr(self.activities_breaker, "state", CircuitState.CLOSED) if self.activities_breaker else CircuitState.CLOSED
         act_failures = getattr(self.activities_breaker, "failure_count", 0) if self.activities_breaker else 0
         act_details = {
-            "state": str(act_breaker_state),
+            "circuit_state": str(act_breaker_state),
             "failure_count": act_failures,
             "has_breaker": bool(self.activities_breaker)
         }
 
+        # 检查是否有可用快照缓存 (Phase 7 F01)
+        has_valid_cache = False
+        snap_to_check = self.initial_snapshot
+        if snap_to_check is not None and getattr(snap_to_check, "complete", False) is True:
+            age = time.time() - getattr(snap_to_check, "fetched_at", 0)
+            if age <= self.max_snapshot_age_sec:
+                has_valid_cache = True
+        act_details["has_valid_cache"] = has_valid_cache
+
         if act_breaker_state == CircuitState.OPEN:
-            # activities 熔断开启：若无本地有效快照，则无法抢课
-            act_item = PreflightCheckItem(
-                name="network_activities",
-                category="network",
-                status=CheckItemStatus.FAIL,
-                critical=True,
-                message=f"activities 接口熔断开启 (OPEN)，接口故障暂停轮询",
-                details=act_details,
-                duration_ms=(time.time() - t0) * 1000
-            )
+            if has_valid_cache:
+                act_item = PreflightCheckItem(
+                    name="network_activities",
+                    category="network",
+                    status=CheckItemStatus.WARN,
+                    critical=False,
+                    message="activities 接口熔断开启 (OPEN)，但存在有效本地快照，降级至缓存模式 (ACTIVITY_CACHE)",
+                    details=act_details,
+                    duration_ms=(time.time() - t0) * 1000
+                )
+            else:
+                act_item = PreflightCheckItem(
+                    name="network_activities",
+                    category="network",
+                    status=CheckItemStatus.FAIL,
+                    critical=True,
+                    message="activities 接口熔断开启 (OPEN) 且无有效快照缓存，禁止启动抢课",
+                    details=act_details,
+                    duration_ms=(time.time() - t0) * 1000
+                )
         else:
             act_item = PreflightCheckItem(
                 name="network_activities",
                 category="network",
                 status=CheckItemStatus.OK,
                 critical=True,
-                message=f"activities 熔断器正常 ({act_breaker_state})",
+                message=f"activities 熔断器处于 {act_breaker_state} 状态 (失败计数: {act_failures})",
                 details=act_details,
                 duration_ms=(time.time() - t0) * 1000
             )
@@ -426,19 +448,19 @@ class PreflightChecker:
         conf_breaker_state = getattr(self.conflict_breaker, "state", ConflictState.NORMAL) if self.conflict_breaker else ConflictState.NORMAL
         conf_failures = getattr(self.conflict_breaker, "failure_count", 0) if self.conflict_breaker else 0
         conf_details = {
-            "state": str(conf_breaker_state),
+            "circuit_state": str(conf_breaker_state),
             "failure_count": conf_failures,
             "has_breaker": bool(self.conflict_breaker)
         }
 
         if conf_breaker_state == ConflictState.OPEN:
-            # checkConflict 熔断开启：标记为 WARN，可降级至 DEGRADED_READY (P02)
+            # checkConflict 熔断开启：标记为 WARN，降级至 LOCAL_CONFLICT (P02, F01)
             conf_item = PreflightCheckItem(
                 name="network_conflict",
                 category="network",
                 status=CheckItemStatus.WARN,
                 critical=False,
-                message=f"checkConflict 接口熔断开启 (OPEN)，将降级使用本地冲突检查 (LOCAL_FALLBACK)",
+                message="checkConflict 接口熔断开启 (OPEN)，将降级使用本地冲突检查 (LOCAL_CONFLICT)",
                 details=conf_details,
                 duration_ms=(time.time() - t1) * 1000
             )
@@ -458,7 +480,7 @@ class PreflightChecker:
                 category="network",
                 status=CheckItemStatus.OK,
                 critical=False,
-                message=f"checkConflict 接口健康 ({conf_breaker_state})",
+                message=f"checkConflict 熔断器处于 {conf_breaker_state} 状态 (失败计数: {conf_failures})",
                 details=conf_details,
                 duration_ms=(time.time() - t1) * 1000
             )
@@ -1276,6 +1298,8 @@ class PreflightChecker:
         checks.append(conf_item)
         if act_item.status == CheckItemStatus.FAIL and act_item.critical:
             failure_reasons.append(f"[活动接口故障] {act_item.message}")
+        elif act_item.status == CheckItemStatus.WARN:
+            warnings.append(f"[活动缓存降级] {act_item.message}")
         if conf_item.status == CheckItemStatus.WARN:
             warnings.append(f"[冲突接口降级] {conf_item.message}")
 
@@ -1323,18 +1347,31 @@ class PreflightChecker:
         elif time_item.status == CheckItemStatus.WARN:
             warnings.append(f"[时间基准警告] {time_item.message}")
 
-        # 9. 最终状态判定 (Task 9 Decision Tree)
+        # 9. 最终状态判定 (Task 9 & Phase 7 F01 细化决策树)
         # 只要存在任何关键检查失败 -> BLOCKED
         if failure_reasons:
             final_status = PreflightStatus.BLOCKED
             final_mode = PreflightMode.BLOCKED
-        elif conf_item.status in (CheckItemStatus.WARN, CheckItemStatus.FAIL):
-            # checkConflict 存在异常，但所有安全关键项（认证、快照、StateStore、锁、审计等）均正常 -> DEGRADED_READY
-            final_status = PreflightStatus.DEGRADED_READY
-            final_mode = PreflightMode.LOCAL_FALLBACK
         else:
-            final_status = PreflightStatus.READY
-            final_mode = PreflightMode.SERVER_MODE
+            act_degraded = (act_item.status == CheckItemStatus.WARN)
+            conf_degraded = (conf_item.status in (CheckItemStatus.WARN, CheckItemStatus.FAIL))
+
+            if act_degraded and conf_degraded:
+                # 两个接口均故障，但本地快照有效且本地冲突规则有效 -> DEGRADED_FULL (DEGRADED_READY)
+                final_status = PreflightStatus.DEGRADED_READY
+                final_mode = PreflightMode.DEGRADED_FULL
+            elif act_degraded:
+                # activities 故障但存在有效快照 -> ACTIVITY_CACHE (DEGRADED_READY)
+                final_status = PreflightStatus.DEGRADED_READY
+                final_mode = PreflightMode.ACTIVITY_CACHE
+            elif conf_degraded:
+                # checkConflict 故障但本地冲突规则可用 -> LOCAL_CONFLICT (DEGRADED_READY)
+                final_status = PreflightStatus.DEGRADED_READY
+                final_mode = PreflightMode.LOCAL_CONFLICT
+            else:
+                # 全链路健康 -> SERVER_MODE (READY)
+                final_status = PreflightStatus.READY
+                final_mode = PreflightMode.SERVER_MODE
 
         end_ts = time.time()
         end_iso = datetime.datetime.now().isoformat(timespec="milliseconds")

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import threading
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -124,6 +125,7 @@ class AuditLogger:
     def __init__(self, logs_dir: str, run_id: Optional[str] = None):
         self.logs_dir = os.path.abspath(logs_dir)
         os.makedirs(self.logs_dir, exist_ok=True)
+        self._lock = threading.RLock()
         self._seq = 0
         self.write_error_count = 0
         # 同一次程序运行使用全局统一的 run_id
@@ -198,14 +200,15 @@ class AuditLogger:
         }
 
         line = json.dumps(record, ensure_ascii=False)
-        try:
-            with open(self._get_event_path(today_str), "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception as e:
-            self.write_error_count += 1
-            self._mark_run_degraded(self.run_id)
-            # 写入失败必须有明确处理和警告日志，绝不抛出未经捕获的异常打断主业务流程
-            print(f"[警告] 写入审计事件日志失败 (event_id={evt_id}): {e}", file=sys.stderr)
+        with self._lock:
+            try:
+                with open(self._get_event_path(today_str), "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception as e:
+                self.write_error_count += 1
+                self._mark_run_degraded(self.run_id)
+                # 写入失败必须有明确处理和警告日志，绝不抛出未经捕获的异常打断主业务流程
+                print(f"[警告] 写入审计事件日志失败 (event_id={evt_id}): {e}", file=sys.stderr)
 
         return record
 
@@ -282,13 +285,14 @@ class AuditLogger:
         }
 
         line = json.dumps(record, ensure_ascii=False)
-        try:
-            with open(self._get_request_path(today_str), "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception as e:
-            self.write_error_count += 1
-            self._mark_run_degraded(self.run_id)
-            print(f"[警告] 写入请求审计日志失败: {e}", file=sys.stderr)
+        with self._lock:
+            try:
+                with open(self._get_request_path(today_str), "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception as e:
+                self.write_error_count += 1
+                self._mark_run_degraded(self.run_id)
+                print(f"[警告] 写入请求审计日志失败: {e}", file=sys.stderr)
 
         return record
 
