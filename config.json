@@ -20,7 +20,7 @@
   "poll_interval_ms": 500,
   "dry_run": false,
   "busy_slots": [],
-  "now_seconds": 2400,
-  "check_conflict": true,
-  "current_week": 9
+  "now_seconds": 900,
+  "check_conflict": false,
+  "current_week": 10
 }
