@@ -142,15 +142,16 @@ def _request(method, path, params=None, body=None, form=False, auth=True,
 
 class ActivityList(list):
     """
-    带有分页完整性元数据的活动列表。
+    带有分页完整性元数据与状态码的活动列表。
     继承自内置 list，保证 100% 向后兼容所有以列表方式消费 activity 的调用。
     """
-    def __init__(self, items=None, complete=True, total=0, fetched=0, error=None):
+    def __init__(self, items=None, complete=True, total=0, fetched=0, error=None, http_code=None):
         super().__init__(items or [])
         self.complete = bool(complete)
         self.total = int(total)
         self.fetched = int(fetched)
         self.error = error
+        self.http_code = http_code
 
     @property
     def items(self):
@@ -163,6 +164,7 @@ class ActivityList(list):
             "total": self.total,
             "fetched": self.fetched,
             "error": self.error,
+            "http_code": self.http_code,
         }
 
 
@@ -281,26 +283,29 @@ class Client:
             except Exception:
                 pass
 
-    def activities(self, page_size=200, req_timeout=6):
-        """一次拉 200 条，分页拉取全部活动并跟踪分页完整性"""
+    def activities(self, page_size=200, req_timeout=6, max_retries=1):
+        """一次拉 200 条，分页拉取全部活动并跟踪分页完整性与状态码"""
         out, page = [], 1
         total = 0
         complete = True
         err_msg = None
+        last_http_code = None
 
         while page <= 10:
             code, obj = None, None
-            for _ in range(3):
+            for _ in range(max_retries):
                 code, obj = self.call("POST", "education/app/activity/getActivityList",
                                       {"state": 1, "page": page, "size": page_size,
                                        "semesterId": self.s["semesterId"]},
                                        timeout=req_timeout)
                 if code == 200 and isinstance(obj, dict) and obj.get("code") == 0:
                     break
-                time.sleep(0.25)
+                if max_retries > 1:
+                    time.sleep(0.25)
             if code != 200 or not isinstance(obj, dict) or obj.get("code") != 0:
                 self._note_fail(code)
                 complete = False
+                last_http_code = code
                 err_msg = f"第 {page} 页拉取失败 (HTTP {code})"
                 break
             self._note_ok()
@@ -320,7 +325,7 @@ class Client:
             complete = False
             err_msg = f"未拉取全量活动 (已获取 {len(out)}/{total})"
 
-        return ActivityList(out, complete=complete, total=total, fetched=len(out), error=err_msg)
+        return ActivityList(out, complete=complete, total=total, fetched=len(out), error=err_msg, http_code=last_http_code)
 
     def check_conflict(self, activity_id):
         code, obj = self.call("GET", "education/app/activity/checkConflict",
@@ -818,26 +823,45 @@ def _cmd_grab_inner(cfg, st):
 
         try:
             c.ensure_token(300)
-            items = c.activities(page_size=200, req_timeout=6)
+            items = c.activities(page_size=200, req_timeout=6, max_retries=1)
         except Exception as e:
             # 记录故障分类与熔断 (C01, C02)
             http_code = getattr(e, "code", -1) if hasattr(e, "code") else -1
             circuit_breaker.record_failure(http_status=http_code, error=e)
             reporter.record_http_failure(http_code)
-            retry_policy.record_failure()
+            retry_policy.record_failure(http_status=http_code)
             backoff_delay = retry_policy.get_backoff_delay()
             log(f"  拉取活动失败: {e} [熔断: {circuit_breaker.state}, 健康: {retry_policy.state}]，退避 {backoff_delay:.2f} 秒")
             retry_policy.sleep_backoff()
             continue
 
         if not getattr(items, "complete", True):
-            # C09: 健康检查返回不完整列表，不能恢复业务，重新进入 OPEN
-            circuit_breaker.record_success(is_complete=False)
-            log(f"  [列表完整性警告] 活动列表不完整 ({getattr(items, 'error', '未知原因')})，"
-                f"仅拉取到 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，"
-                f"禁止基于不完整数据进行抢课决策，跳过本次轮询")
-            time.sleep(poll)
-            continue
+            http_code = getattr(items, "http_code", None)
+            err_msg = getattr(items, "error", "未知原因")
+
+            # 区分故障类型：服务端基础设施故障 vs 客户端异常 vs 纯数据残缺
+            if http_code is not None and is_server_fault(http_status=http_code):
+                # 记录基础设施故障并累加熔断计数 (C01, C02)
+                circuit_breaker.record_failure(http_status=http_code, error=Exception(err_msg))
+                reporter.record_http_failure(http_code)
+                retry_policy.record_failure(http_status=http_code)
+                backoff_delay = retry_policy.get_backoff_delay()
+                log(f"  [服务端故障] 活动列表拉取失败 (HTTP {http_code}): {err_msg} "
+                    f"[熔断: {circuit_breaker.state}, 失败计数: {circuit_breaker.failure_count}/{circuit_breaker.failure_threshold}]，"
+                    f"退避 {backoff_delay:.2f} 秒")
+                retry_policy.sleep_backoff()
+                continue
+            else:
+                # 客户端异常 (401, 403, 400) 或纯数据残缺
+                # 在 HALF_OPEN 状态下，数据不完整或非健康探测必须重新 OPEN (C09)
+                circuit_breaker.record_success(is_complete=False)
+                if http_code is not None and http_code != 200:
+                    reporter.record_http_failure(http_code)
+                log(f"  [列表完整性警告] 活动列表不完整 ({err_msg})，"
+                    f"仅拉取到 {getattr(items, 'fetched', len(items))}/{getattr(items, 'total', '?')} 条，"
+                    f"禁止基于不完整数据进行抢课决策，跳过本次轮询")
+                time.sleep(poll)
+                continue
         else:
             # 数据完整有效，恢复正常 (C06)
             circuit_breaker.record_success(is_complete=True)

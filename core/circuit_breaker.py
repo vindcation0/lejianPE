@@ -109,6 +109,9 @@ class CircuitBreaker:
         如果是 HALF_OPEN 探测：
         - is_complete 为 True 时，恢复 CLOSED；
         - is_complete 为 False 时（C09：列表残缺），重新 OPEN。
+        如果是 CLOSED 状态：
+        - is_complete 为 True 时，清零失败计数；
+        - is_complete 为 False 时（C13：列表残缺），严禁清零现有失败计数。
         """
         if self.state == CircuitState.HALF_OPEN:
             if is_complete:
@@ -117,7 +120,8 @@ class CircuitBreaker:
                 # C09: 返回不完整列表，不能恢复业务，重新进入 OPEN
                 self._trip_to_open(reason="健康检查数据不完整 (complete=False)")
         elif self.state == CircuitState.CLOSED:
-            self.failure_count = 0
+            if is_complete:
+                self.failure_count = 0
 
         self._half_open_probe_in_progress = False
         return self.state
@@ -131,17 +135,20 @@ class CircuitBreaker:
         """
         记录请求失败。
         对故障进行严格分类，仅在服务端基础设施故障时累加失败计数并触发熔断。
+        在 HALF_OPEN 状态下，任何探测失败均立即重新进入 OPEN。
         """
+        if self.state == CircuitState.HALF_OPEN:
+            # HALF_OPEN 探测未成功，必须重新进入 OPEN，绝不允许在 HALF_OPEN 挂起
+            self._trip_to_open(reason=f"HALF_OPEN 探测失败 (http={http_status}, err={error})")
+            return self.state
+
         if not force_trip and not is_server_fault(http_status=http_status, error=error):
-            # 业务错误（如名额已满）或客户端错误不计入熔断
+            # 业务错误（如名额已满）或客户端错误 (401, 403, 400) 不计入基础设施熔断
             return self.state
 
         self.failure_count += 1
 
-        if self.state == CircuitState.HALF_OPEN:
-            # C07: HALF_OPEN 探测失败，重新进入 OPEN
-            self._trip_to_open(reason=f"HALF_OPEN 探测失败 (http={http_status}, err={error})")
-        elif self.state == CircuitState.CLOSED:
+        if self.state == CircuitState.CLOSED:
             if force_trip or self.failure_count >= self.failure_threshold:
                 # C02: 连续达到阈值，进入 OPEN
                 self._trip_to_open(reason=f"连续故障达到阈值 ({self.failure_count}/{self.failure_threshold})")
