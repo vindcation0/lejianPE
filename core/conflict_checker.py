@@ -33,6 +33,9 @@ class ConflictCircuitState:
     # 兼容别名
     CLOSED = "NORMAL"
 
+# 别名导出
+ConflictState = ConflictCircuitState
+
 
 class ConflictCheckMode:
     """冲突检查业务模式"""

@@ -32,6 +32,7 @@ class EventType:
     RECONCILIATION = "reconciliation"
     INFRASTRUCTURE = "infrastructure"
     CONFLICT = "conflict"
+    PREFLIGHT = "preflight"
 
 
 class EventName:
@@ -82,6 +83,13 @@ class EventName:
     LOCAL_CONFLICT_DETECTED = "local_conflict_detected"
     LOCAL_CONFLICT_CHECK_BLOCKED = "local_conflict_check_blocked"
     CONFLICT_SERVICE_RECOVERED = "conflict_service_recovered"
+
+    # 7. Preflight 抢课前健康检查 (Phase 6)
+    PREFLIGHT_STARTED = "preflight_started"
+    PREFLIGHT_CHECK_COMPLETED = "preflight_check_completed"
+    PREFLIGHT_DEGRADED = "preflight_degraded"
+    PREFLIGHT_BLOCKED = "preflight_blocked"
+    PREFLIGHT_READY = "preflight_ready"
 
 
 def sanitize_data(val: Any) -> Any:

@@ -52,6 +52,11 @@ from core.conflict_checker import (
     LocalConflictChecker,
     ConflictManager
 )
+from core.preflight import (
+    PreflightChecker,
+    PreflightStatus,
+    PreflightMode
+)
 
 BASE = "https://cpes.legym.cn/"
 STATE = os.path.join(ROOT, "state.json")
@@ -982,6 +987,32 @@ def _cmd_grab_inner(cfg, st):
 
     tt = load_timetable()
     conflict_manager.tt = tt
+
+    # ---------------- Phase 6: Preflight 抢课前健康检查系统 ----------------
+    preflight_checker = PreflightChecker(
+        client=c,
+        state_store=state_store,
+        audit_logger=audit_logger,
+        cfg=cfg,
+        tt=tt,
+        activities_breaker=circuit_breaker,
+        conflict_breaker=conflict_breaker,
+        local_checker=local_conflict_checker,
+        lock_path=LOCK_PATH,
+        run_id=audit_logger.run_id
+    )
+    preflight_rep = preflight_checker.run_all_checks(
+        output_report_path=os.path.join(LOGS, "preflight_report.json")
+    )
+    log(preflight_rep.format_console())
+    if preflight_rep.status == PreflightStatus.BLOCKED:
+        log("[Preflight 安全阻断] 存在关键健康检查失败项，抢课程序已安全中止！")
+        return
+    elif preflight_rep.status == PreflightStatus.DEGRADED_READY:
+        log("[Preflight 降级提醒] checkConflict 故障，将自动降级进入本地规则冲突判定模式 (LOCAL_FALLBACK)！")
+    else:
+        log("[Preflight 就绪] 全部健康检查项通过，进入标准抢课模式 (READY)！")
+
     cw = current_week(tt)
     status_text, _, tw = get_semester_status(tt)
     if cw < 1 or cw > tw:
@@ -1451,6 +1482,37 @@ def cmd_editor():
     run_editor()
 
 
+def cmd_preflight():
+    """抢课前综合健康检查命令行入口 (Phase 6 Preflight)"""
+    cfg = load_json(CONFIG, {})
+    st = load_json(STATE)
+    if not st:
+        sys.exit("没有 state.json，请先登录并同步状态")
+
+    audit_logger = AuditLogger(LOGS)
+    c = Client(st, audit_logger=audit_logger)
+    state_store = StateStore(DB_PATH)
+    tt = load_timetable()
+    circuit_breaker = CircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0, audit_logger=audit_logger)
+    conflict_breaker = ConflictCircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0, audit_logger=audit_logger)
+
+    checker = PreflightChecker(
+        client=c,
+        state_store=state_store,
+        audit_logger=audit_logger,
+        cfg=cfg,
+        tt=tt,
+        activities_breaker=circuit_breaker,
+        conflict_breaker=conflict_breaker,
+        lock_path=LOCK_PATH,
+        run_id=audit_logger.run_id
+    )
+    rep = checker.run_all_checks(output_report_path=os.path.join(LOGS, "preflight_report.json"))
+    log(rep.format_console())
+    if rep.status == PreflightStatus.BLOCKED:
+        sys.exit(1)
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     {"status": cmd_status, "list": cmd_list, "grab": cmd_grab,
@@ -1458,7 +1520,8 @@ def main():
      "refresh": cmd_refresh, "editor": cmd_editor,
      "login": cmd_login, "reinit": cmd_reinit,
      "setup": cmd_setup, "wizard": cmd_setup,
-     "doctor": cmd_doctor, "--doctor": cmd_doctor}.get(cmd, cmd_status)()
+     "doctor": cmd_doctor, "--doctor": cmd_doctor,
+     "preflight": cmd_preflight, "--preflight": cmd_preflight}.get(cmd, cmd_status)()
 
 
 if __name__ == "__main__":
