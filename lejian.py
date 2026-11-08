@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -213,7 +214,9 @@ class ActivityList(list):
         http_code=None,
         fetched_at=None,
         run_id=None,
-        source="getActivityList"
+        source="getActivityList",
+        session_scope_id=None,
+        user_id=None
     ):
         super().__init__(items or [])
         self.complete = bool(complete)
@@ -224,6 +227,8 @@ class ActivityList(list):
         self.fetched_at = fetched_at if fetched_at is not None else time.time()
         self.run_id = run_id
         self.source = source
+        self.session_scope_id = session_scope_id
+        self.user_id = user_id
 
     @property
     def items(self):
@@ -239,7 +244,9 @@ class ActivityList(list):
             "http_code": self.http_code,
             "fetched_at": self.fetched_at,
             "run_id": self.run_id,
-            "source": self.source
+            "source": self.source,
+            "session_scope_id": self.session_scope_id,
+            "user_id": self.user_id
         }
 
 
@@ -248,6 +255,33 @@ class Client:
         self.s = state
         self.audit_logger = audit_logger
         self._refresh_lock = threading.RLock()
+
+    def get_session_scope_id(self) -> Optional[str]:
+        """
+        生成非敏感会话范围标识 (session_scope_id)。
+        基于当前认证会话凭据派生截断哈希，绝不包含任何明文 Token 或密钥。
+        当 Token 刷新或重新登录时，session_scope_id 自动变化，使旧快照自动失效。
+        """
+        token = ""
+        if isinstance(self.s, dict):
+            token = self.s.get("refreshToken") or self.s.get("accessToken") or ""
+        if not token:
+            return None
+        import hashlib
+        return "sess_" + hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:16]
+
+    def get_user_scope_id(self) -> Optional[str]:
+        """
+        生成非敏感用户范围标识 (user_id / user_scope_id)。
+        基于学号/账号/userId 派生截断哈希，绝不泄露敏感个人信息。
+        """
+        u = ""
+        if isinstance(self.s, dict):
+            u = self.s.get("userId") or self.s.get("studentId") or self.s.get("account") or self.s.get("schoolId") or ""
+        if not u:
+            return None
+        import hashlib
+        return "u_" + hashlib.sha256(str(u).encode("utf-8")).hexdigest()[:12]
 
     def expires_in(self):
         try:
@@ -448,7 +482,9 @@ class Client:
             http_code=last_http_code,
             fetched_at=time.time(),
             run_id=getattr(self.audit_logger, "run_id", None) if hasattr(self, "audit_logger") and self.audit_logger else None,
-            source="education/app/activity/getActivityList"
+            source="education/app/activity/getActivityList",
+            session_scope_id=self.get_session_scope_id(),
+            user_id=self.get_user_scope_id()
         )
 
     def check_conflict(self, activity_id):
@@ -1179,7 +1215,9 @@ def _cmd_grab_inner(cfg, st):
                     week_done=week_done,
                     correlation_id=f"corr_grab_{aid}_{int(time.time()*1000)}",
                     run_id=audit_logger.run_id if audit_logger else None,
-                    current_week=wk
+                    current_week=wk,
+                    current_session_scope_id=c.get_session_scope_id(),
+                    current_user_id=c.get_user_scope_id()
                 )
                 if not conf_ok:
                     return False, conf_reason

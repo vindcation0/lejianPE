@@ -87,7 +87,9 @@ class ActivityList(list):
         http_code=200,
         fetched_at=None,
         run_id=None,
-        source="getActivityList"
+        source="getActivityList",
+        session_scope_id=None,
+        user_id=None
     ):
         super().__init__(items or [])
         self.complete = bool(complete)
@@ -98,6 +100,8 @@ class ActivityList(list):
         self.fetched_at = fetched_at if fetched_at is not None else time.time()
         self.run_id = run_id
         self.source = source
+        self.session_scope_id = session_scope_id
+        self.user_id = user_id
 
 
 class ConflictCircuitBreaker:
@@ -355,7 +359,9 @@ class LocalConflictChecker:
         tt: Optional[Dict] = None,
         reconciliation_in_progress: bool = False,
         current_run_id: Optional[str] = None,
-        max_snapshot_age_sec: float = 60.0
+        max_snapshot_age_sec: float = 60.0,
+        current_session_scope_id: Optional[str] = None,
+        current_user_id: Optional[str] = None
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         任务三：本地数据完整性检查。
@@ -369,7 +375,13 @@ class LocalConflictChecker:
             "candidate_valid": False,
             "registered_times_valid": True,
             "unresolved_count": 0,
-            "reconciliation_active": reconciliation_in_progress
+            "reconciliation_active": reconciliation_in_progress,
+            "snapshot_run_id": None,
+            "current_run_id": current_run_id,
+            "snapshot_session_scope_id": None,
+            "current_session_scope_id": current_session_scope_id,
+            "snapshot_user_id": None,
+            "current_user_id": current_user_id
         }
 
         # 1. 正在进行全局对账
@@ -444,6 +456,20 @@ class LocalConflictChecker:
                     except Exception:
                         pass
 
+        # 6.4 用户范围一致性检查 (Task 2: C44)
+        items_user_id = getattr(items, "user_id", None)
+        details["snapshot_user_id"] = items_user_id
+        if current_user_id is not None and items_user_id is not None:
+            if str(items_user_id) != str(current_user_id):
+                return False, f"本地数据快照用户范围不匹配 (快照 user_id={items_user_id}, 当前 user_id={current_user_id})，禁止跨用户混用数据", details
+
+        # 6.5 认证会话范围一致性检查 (Task 2: C45, C48)
+        items_session_scope_id = getattr(items, "session_scope_id", None)
+        details["snapshot_session_scope_id"] = items_session_scope_id
+        if current_session_scope_id is not None and items_session_scope_id is not None:
+            if str(items_session_scope_id) != str(current_session_scope_id):
+                return False, f"本地数据快照认证会话不匹配 (快照 session_scope_id={items_session_scope_id}, 当前 session_scope_id={current_session_scope_id})，旧会话快照已失效", details
+
         # 7. 每条已报课程的时间信息有效性检查
         for it in items:
             if not isinstance(it, dict):
@@ -489,7 +515,9 @@ class LocalConflictChecker:
         week_done: Optional[Dict] = None,
         reconciliation_in_progress: bool = False,
         current_run_id: Optional[str] = None,
-        max_snapshot_age_sec: float = 60.0
+        max_snapshot_age_sec: float = 60.0,
+        current_session_scope_id: Optional[str] = None,
+        current_user_id: Optional[str] = None
     ) -> ConflictCheckResult:
         """
         任务二：本地冲突检查核心逻辑。
@@ -502,7 +530,9 @@ class LocalConflictChecker:
             tt=tt,
             reconciliation_in_progress=reconciliation_in_progress,
             current_run_id=current_run_id,
-            max_snapshot_age_sec=max_snapshot_age_sec
+            max_snapshot_age_sec=max_snapshot_age_sec,
+            current_session_scope_id=current_session_scope_id,
+            current_user_id=current_user_id
         )
         if not ok:
             return ConflictCheckResult(
@@ -675,6 +705,20 @@ class LocalConflictChecker:
         )
 
 
+def _safe_get_scope_id(client: Any, method_name: str) -> Optional[str]:
+    """安全获取 client 的非敏感作用域 ID，防范 Mock 对象自动生成非字符串属性"""
+    if client is not None and hasattr(client, method_name):
+        attr = getattr(client, method_name)
+        if callable(attr):
+            try:
+                val = attr()
+                if isinstance(val, str) and val.strip():
+                    return str(val).strip()
+            except Exception:
+                pass
+    return None
+
+
 class ConflictManager:
     """
     冲突检查统一协调器 (ConflictManager)
@@ -698,7 +742,9 @@ class ConflictManager:
         audit_logger: Optional[AuditLogger] = None,
         cfg: Optional[Dict] = None,
         tt: Optional[Dict] = None,
-        state_store: Optional[StateStore] = None
+        state_store: Optional[StateStore] = None,
+        session_scope_id: Optional[str] = None,
+        user_id: Optional[str] = None
     ):
         self.client = client
         self.breaker = breaker or ConflictCircuitBreaker(audit_logger=audit_logger)
@@ -707,6 +753,8 @@ class ConflictManager:
         self.cfg = cfg or {}
         self.tt = tt or {}
         self.state_store = state_store
+        self.session_scope_id = session_scope_id or _safe_get_scope_id(client, "get_session_scope_id")
+        self.user_id = user_id or _safe_get_scope_id(client, "get_user_scope_id")
 
     def _emit_audit(
         self,
@@ -752,7 +800,9 @@ class ConflictManager:
         run_id: Optional[str] = None,
         current_week: Optional[int] = None,
         reconciliation_in_progress: bool = False,
-        max_snapshot_age_sec: float = 60.0
+        max_snapshot_age_sec: float = 60.0,
+        current_session_scope_id: Optional[str] = None,
+        current_user_id: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         核心对外入口：评估候选活动是否存在冲突。
@@ -763,6 +813,8 @@ class ConflictManager:
         aid = str(candidate.get("id"))
         cid = correlation_id or f"corr_conf_{aid}_{int(time.time()*1000)}"
         r_id = run_id or (getattr(self.audit_logger, "run_id", None) if self.audit_logger else None)
+        sess_scope = current_session_scope_id or self.session_scope_id
+        usr_scope = current_user_id or self.user_id
 
         server_check_enabled = bool(self.cfg.get("check_conflict", True))
 
@@ -782,7 +834,9 @@ class ConflictManager:
                 current_week=current_week,
                 reconciliation_in_progress=reconciliation_in_progress,
                 current_run_id=r_id,
-                max_snapshot_age_sec=max_snapshot_age_sec
+                max_snapshot_age_sec=max_snapshot_age_sec,
+                current_session_scope_id=sess_scope,
+                current_user_id=usr_scope
             )
 
         # ---------------- 场景 2: 熔断器检查与服务端调用 ----------------
@@ -812,7 +866,9 @@ class ConflictManager:
                 current_week=current_week,
                 reconciliation_in_progress=reconciliation_in_progress,
                 current_run_id=r_id,
-                max_snapshot_age_sec=max_snapshot_age_sec
+                max_snapshot_age_sec=max_snapshot_age_sec,
+                current_session_scope_id=sess_scope,
+                current_user_id=usr_scope
             )
 
         # 允许请求 (NORMAL 或 HALF_OPEN 探测)
@@ -854,6 +910,10 @@ class ConflictManager:
             call_err = e
             code = getattr(e, "code", -1) if hasattr(e, "code") else -1
             is_conflict = None
+        finally:
+            # 极端防御：确保半开探测许可必定释放，杜绝永久锁定 (C39, C41, C42)
+            if is_probe and hasattr(self.breaker, "_half_open_probe_in_progress"):
+                self.breaker._half_open_probe_in_progress = False
 
         dur_ms = round((time.time() - t0) * 1000, 2)
 
@@ -879,7 +939,7 @@ class ConflictManager:
                 return True, "服务端判定无冲突"
 
         # 2.2 客户端错误 (401, 403, 400 等) - 严禁计入基础设施故障
-        if code in (400, 401, 403, 404):
+        if code is not None and 400 <= code < 500:
             self.breaker.record_failure(http_status=code)
             self._emit_audit(
                 event_name=EventName.CONFLICT_CHECK_FAILED,
@@ -944,7 +1004,9 @@ class ConflictManager:
             current_week=current_week,
             reconciliation_in_progress=reconciliation_in_progress,
             current_run_id=r_id,
-            max_snapshot_age_sec=max_snapshot_age_sec
+            max_snapshot_age_sec=max_snapshot_age_sec,
+            current_session_scope_id=sess_scope,
+            current_user_id=usr_scope
         )
 
     def _execute_local_fallback(
@@ -961,11 +1023,40 @@ class ConflictManager:
         current_week: Optional[int],
         reconciliation_in_progress: bool,
         current_run_id: Optional[str] = None,
-        max_snapshot_age_sec: float = 60.0
+        max_snapshot_age_sec: float = 60.0,
+        current_session_scope_id: Optional[str] = None,
+        current_user_id: Optional[str] = None
     ) -> Tuple[bool, str]:
         """执行本地降级冲突检查流程"""
         if current_run_id is None:
             current_run_id = r_id
+        if current_session_scope_id is None:
+            current_session_scope_id = self.session_scope_id
+        if current_user_id is None:
+            current_user_id = self.user_id
+
+        # 任务二 (C47): 如果本地快照已过期或缺失新鲜度，且活动列表接口可用，优先尝试刷新最新数据
+        is_snapshot_stale = False
+        if hasattr(items, "fetched_at") and getattr(items, "fetched_at") is not None:
+            try:
+                if (time.time() - float(items.fetched_at)) > max_snapshot_age_sec:
+                    is_snapshot_stale = True
+            except (ValueError, TypeError):
+                is_snapshot_stale = True
+        elif not hasattr(items, "fetched_at"):
+            is_snapshot_stale = True
+
+        if is_snapshot_stale and hasattr(self.client, "activities"):
+            try:
+                attr = getattr(self.client, "activities")
+                if callable(attr):
+                    refreshed = attr()
+                    # 只有明确返回了列表结构时才采纳，防范 Mock 自动生成的无意义对象
+                    if isinstance(refreshed, (list, tuple)):
+                        items = refreshed
+            except Exception:
+                # 刷新异常 (C47)，严禁沿用过期快照放行，保持过期 items 触发超时安全阻断
+                pass
 
         self._emit_audit(
             event_name=EventName.LOCAL_CONFLICT_CHECK_STARTED,
@@ -989,7 +1080,9 @@ class ConflictManager:
             week_done=week_done,
             reconciliation_in_progress=reconciliation_in_progress,
             current_run_id=current_run_id,
-            max_snapshot_age_sec=max_snapshot_age_sec
+            max_snapshot_age_sec=max_snapshot_age_sec,
+            current_session_scope_id=current_session_scope_id,
+            current_user_id=current_user_id
         )
 
         # 3.1 本地数据不完整，安全阻断 (BLOCKED)

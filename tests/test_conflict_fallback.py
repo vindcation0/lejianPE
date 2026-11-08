@@ -848,6 +848,222 @@ class ConflictFallbackTestSuite(unittest.TestCase):
         self.assertIn("UNKNOWN", reason)
         self.assertIn("安全屏障阻断", reason)
 
+    # =========================================================================
+    # Phase 5 最终补充用例 (C39 ~ C48)：HALF_OPEN 恢复与快照上下文安全
+    # =========================================================================
+
+    def test_C39_half_open_probe_401_releases_probe_permit(self):
+        """C39: HALF_OPEN 探测返回 401，探测许可正确释放"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        self.mock_client.call.return_value = (401, {"code": 401, "msg": "Token expired"})
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        mgr.breaker.state = ConflictCircuitState.HALF_OPEN
+        mgr.breaker._half_open_probe_in_progress = False
+
+        items = ActivityList([], complete=True)
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok)
+        self.assertIn("401", reason)
+
+        # 状态保持 HALF_OPEN，且探测许可正确释放 (False)
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.HALF_OPEN)
+        self.assertFalse(mgr.breaker._half_open_probe_in_progress)
+        self.assertEqual(mgr.breaker.failure_count, 0)
+
+    def test_C40_auth_recovered_half_open_re_probes_and_recovers_to_normal(self):
+        """C40: 认证恢复后，HALF_OPEN 可以重新进行健康探测并恢复 NORMAL"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        mgr.breaker.state = ConflictCircuitState.HALF_OPEN
+        mgr.breaker._half_open_probe_in_progress = False
+
+        # 1. 第一次探测遇到 401
+        self.mock_client.call.return_value = (401, {"code": 401, "msg": "Token expired"})
+        items = ActivityList([], complete=True)
+        ok1, reason1 = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok1)
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.HALF_OPEN)
+        self.assertFalse(mgr.breaker._half_open_probe_in_progress)
+
+        # 2. 认证恢复 (Token 刷新成功)，再次探测返回 200 有效响应
+        self.mock_client.call.return_value = (200, {"code": 0, "data": False})
+        ok2, reason2 = mgr.check_activity_conflict(cand, items)
+        self.assertTrue(ok2)
+        self.assertIn("服务端判定无冲突", reason2)
+        # 熔断器平滑恢复 NORMAL
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.NORMAL)
+        self.assertFalse(mgr.breaker._half_open_probe_in_progress)
+
+    def test_C41_half_open_probe_403_does_not_recover_normal_and_releases_lock(self):
+        """C41: HALF_OPEN 探测返回 403，不错误恢复 NORMAL，也不永久卡死"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        self.mock_client.call.return_value = (403, {"code": 403, "msg": "Forbidden"})
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        mgr.breaker.state = ConflictCircuitState.HALF_OPEN
+        mgr.breaker._half_open_probe_in_progress = False
+
+        items = ActivityList([], complete=True)
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok)
+        self.assertIn("403", reason)
+
+        # 绝不误恢复为 NORMAL
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.HALF_OPEN)
+        # 探测许可必须释放，避免永久卡死
+        self.assertFalse(mgr.breaker._half_open_probe_in_progress)
+        can_retry, _ = mgr.breaker.can_attempt()
+        self.assertTrue(can_retry)
+
+    def test_C42_half_open_probe_400_no_infra_accumulation_and_can_reschedule(self):
+        """C42: HALF_OPEN 探测返回 400，不累计基础设施故障，并能够重新调度探测"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        self.mock_client.call.return_value = (400, {"code": 400, "msg": "Bad request"})
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        mgr.breaker.state = ConflictCircuitState.HALF_OPEN
+        mgr.breaker._half_open_probe_in_progress = False
+
+        items = ActivityList([], complete=True)
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok)
+        self.assertIn("400", reason)
+
+        self.assertEqual(mgr.breaker.failure_count, 0)
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.HALF_OPEN)
+        self.assertFalse(mgr.breaker._half_open_probe_in_progress)
+        can_retry, _ = mgr.breaker.can_attempt()
+        self.assertTrue(can_retry)
+
+    def test_C43_half_open_concurrent_requests_only_one_probes_others_degrade(self):
+        """C43: HALF_OPEN 多个并发请求仍然最多只有一个实际探测，其余请求自动降级"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        items = ActivityList([], complete=True)
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        mgr.breaker.state = ConflictCircuitState.HALF_OPEN
+        mgr.breaker._half_open_probe_in_progress = False
+
+        # 模拟第一个并发请求已经获取了探测许可并在执行中
+        can1, msg1 = mgr.breaker.can_attempt()
+        self.assertTrue(can1)
+        self.assertTrue(mgr.breaker._half_open_probe_in_progress)
+
+        # 第二个并发请求调用 check_activity_conflict
+        # 此时探测进行中，第二个请求禁止发起服务端调用，自动切入本地降级
+        ok2, reason2 = mgr.check_activity_conflict(cand, items)
+        self.assertTrue(ok2)
+        self.assertIn("本地规则检查通过", reason2)
+        # 服务端接口未被并发调用
+        self.mock_client.call.assert_not_called()
+
+    def test_C44_different_users_snapshots_cannot_be_mixed(self):
+        """C44: 不同用户的快照不能混用"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        items_userA = ActivityList([], complete=True, fetched_at=time.time(), user_id="u_alice_123")
+        ok, msg, details = checker.check_data_integrity(cand, items_userA, current_user_id="u_bob_456")
+        self.assertFalse(ok)
+        self.assertIn("用户范围不匹配", msg)
+
+        res = checker.check_conflict(cand, items_userA, current_user_id="u_bob_456")
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+        # ConflictManager 降级时也严格阻断
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable, user_id="u_bob_456")
+        ok_mgr, reason_mgr = mgr.check_activity_conflict(cand, items_userA)
+        self.assertFalse(ok_mgr)
+        self.assertIn("用户范围不匹配", reason_mgr)
+
+    def test_C45_old_snapshot_invalid_after_session_switch(self):
+        """C45: 认证会话切换后，旧快照必须失效"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        items_old_sess = ActivityList([], complete=True, fetched_at=time.time(), session_scope_id="sess_old_token_111")
+        ok, msg, details = checker.check_data_integrity(cand, items_old_sess, current_session_scope_id="sess_new_token_222")
+        self.assertFalse(ok)
+        self.assertIn("认证会话不匹配", msg)
+
+        res = checker.check_conflict(cand, items_old_sess, current_session_scope_id="sess_new_token_222")
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable, session_scope_id="sess_new_token_222")
+        ok_mgr, reason_mgr = mgr.check_activity_conflict(cand, items_old_sess)
+        self.assertFalse(ok_mgr)
+        self.assertIn("认证会话不匹配", reason_mgr)
+
+    def test_C46_snapshot_complete_true_only_when_all_pages_succeed(self):
+        """C46: 快照 complete=True 只有在所有分页成功后才能成立"""
+        from lejian import Client
+        fake_state = {"semesterId": "sem_2026", "refreshToken": "test_ref", "userId": "user_01"}
+        client = Client(fake_state)
+
+        # 1. 模拟分页拉取：总计 20 条，第 1 页成功 (10条)，第 2 页失败 (500)
+        client.call = MagicMock(side_effect=[
+            (200, {"code": 0, "data": {"items": [{"id": f"act_{i}", "startTime": 1731132000000, "endTime": 1731137700000} for i in range(10)], "total": 20}}),
+            (500, {"code": -1, "msg": "Internal Server Error"})
+        ])
+        incomplete_list = client.activities()
+        self.assertFalse(incomplete_list.complete)
+        self.assertEqual(incomplete_list.fetched, 10)
+        self.assertEqual(incomplete_list.total, 20)
+        self.assertIn("第 2 页拉取失败", incomplete_list.error)
+
+        # 2. 模拟全部分页均成功
+        client.call = MagicMock(side_effect=[
+            (200, {"code": 0, "data": {"items": [{"id": f"act_{i}", "startTime": 1731132000000, "endTime": 1731137700000} for i in range(10)], "total": 20}}),
+            (200, {"code": 0, "data": {"items": [{"id": f"act_{i}", "startTime": 1731132000000, "endTime": 1731137700000} for i in range(10, 20)], "total": 20}})
+        ])
+        complete_list = client.activities()
+        self.assertTrue(complete_list.complete)
+        self.assertEqual(complete_list.fetched, 20)
+        self.assertEqual(complete_list.total, 20)
+        self.assertIsNone(complete_list.error)
+
+    def test_C47_refresh_failed_cannot_reuse_expired_snapshot(self):
+        """C47: 活动列表刷新失败后，不得沿用过期快照放行"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        expired_items = ActivityList([], complete=True, fetched_at=time.time() - 120.0)
+
+        # 模拟刷新失败 (activities 返回 complete=False)
+        self.mock_client.activities = MagicMock(return_value=ActivityList([], complete=False, error="刷新超时失败"))
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable)
+        ok, reason = mgr.check_activity_conflict(cand, expired_items, max_snapshot_age_sec=60.0)
+
+        self.assertFalse(ok)
+        self.mock_client.activities.assert_called_once()
+        # 绝不放行，严格阻断
+        self.assertTrue("安全阻断" in reason or "分页不完整" in reason or "超过有效期" in reason)
+
+    def test_C48_same_run_id_but_different_session_scope_id_blocked(self):
+        """C48: 相同 run_id 但不同 session_scope_id 必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        items = ActivityList([], complete=True, fetched_at=time.time(), run_id="run_batch_2026", session_scope_id="sess_scope_AAA")
+        ok, msg, details = checker.check_data_integrity(
+            cand, items, current_run_id="run_batch_2026", current_session_scope_id="sess_scope_BBB"
+        )
+        self.assertFalse(ok)
+        self.assertIn("认证会话不匹配", msg)
+
+        res = checker.check_conflict(
+            cand, items, current_run_id="run_batch_2026", current_session_scope_id="sess_scope_BBB"
+        )
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable, session_scope_id="sess_scope_BBB")
+        ok_mgr, reason_mgr = mgr.check_activity_conflict(cand, items, run_id="run_batch_2026")
+        self.assertFalse(ok_mgr)
+        self.assertIn("认证会话不匹配", reason_mgr)
+
 
 if __name__ == "__main__":
     unittest.main()
