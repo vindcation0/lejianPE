@@ -52,13 +52,16 @@ class RecoveryManager:
             orig_status = rec["status"]
 
             self.state_store.record_verifying(aid)
-            verified, is_reg, _ = self.req_mgr.verify_registration(aid)
+            verified, is_reg, remote_item = self.req_mgr.verify_registration(aid)
 
             if verified:
                 if is_reg:
                     # 服务端已确认存在有效报名
                     self.state_store.record_success(aid, name, http_status=200)
-                    summary["recovered_success"].append(rec)
+                    rec_copy = dict(rec)
+                    if remote_item:
+                        rec_copy["remote_item"] = remote_item
+                    summary["recovered_success"].append(rec_copy)
                     self.audit_logger.log_event("startup_recovered_success", {
                         "aid": aid,
                         "name": name,

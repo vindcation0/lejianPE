@@ -241,12 +241,22 @@ class RequestManager:
         """
         通过查询接口获取活动列表，核实 target activity 是否已报名 (isRegister)。
         返回: (verified: bool, is_registered: Optional[bool], item: Optional[dict])
-        注意：
-        - 如果查询接口失败，或者列表中未找到目标活动，返回 (False, None, None)，绝对不能视作未报名！
-        - 只有在列表中找到目标活动且读到 isRegister 时，verified 才为 True。
+
+        严格判定规则：
+        1. 确认已报名 (True, True, item)：
+           - 列表中检索到目标活动，且 isRegister 为 True。
+        2. 确认未报名 (True, False, item)：
+           - 列表拉取成功（HTTP 200，无网络异常）；
+           - 分页数据完整（complete 明确为 True）；
+           - 列表中检索到目标活动，且 isRegister 明确为 False。
+        3. 无法确认 (False, None, None)：
+           - 网络超时、连接失败或 HTTP 5xx；
+           - 列表分页失败或数据不完整 (complete 为 False 或未知)；
+           - 列表中未检索到目标活动（可能下架、不可见或分页截断）；
+           - 返回数据结构异常或为空。
         """
         try:
-            # 使用 client 的 activities 拉取最新列表
+            # 使用 client 的 activities 拉取最新列表（默认 max_retries=0，单次请求无隐式重试）
             items = self.client.activities(page_size=200, req_timeout=timeout)
         except Exception:
             return False, None, None
@@ -254,14 +264,26 @@ class RequestManager:
         if not items or not isinstance(items, list):
             return False, None, None
 
+        # 检查 HTTP 状态码（若存在非 200 则直接判定未确认）
+        http_code = getattr(items, "http_code", None)
+        if http_code is not None and http_code != 200:
+            return False, None, None
+
+        # 检查分页完整性标记（若是 ActivityList 且 complete=False 则为残缺）
+        is_complete = bool(getattr(items, "complete", True))
+
         for it in items:
+            if not isinstance(it, dict):
+                continue
             if str(it.get("id")) == str(activity_id):
                 is_reg = bool(it.get("isRegister"))
                 if is_reg:
+                    # 只要明确确认已在服务端报名，即使分页后续未完也能确认成功
                     return True, True, it
-                if not getattr(items, "complete", True):
+                # 确认未报名必须满足：数据完全完整且无截断
+                if not is_complete:
                     return False, None, None
                 return True, False, it
 
-        # 列表中未检索到该活动（数据不全或已下架），不能轻率断定为未报名
+        # 列表中未检索到该活动（数据不全或已下架），严禁轻率断定为未报名
         return False, None, None

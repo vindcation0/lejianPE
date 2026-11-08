@@ -915,16 +915,18 @@ def _cmd_grab_inner(cfg, st):
             if res_status == RegistrationStatus.SUCCESS:
                 log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认报名成功！")
                 reporter.record_attempt(unres_aid, unres_name, "SUCCESS", "复核确认成功")
-                it_for_quota = remote_item or target_unres
-                if "startTime" in it_for_quota:
+                it_for_quota = remote_item or next((x for x in items if str(x.get("id")) == str(unres_aid)), None) or target_unres
+                if isinstance(it_for_quota, dict) and "startTime" in it_for_quota:
                     try:
                         act_w = week_of_item(it_for_quota)
                         act_d = datetime.date.fromtimestamp(int(it_for_quota["startTime"]) / 1000)
                         if is_special(it_for_quota, cfg):
                             special_done += 1
                         else:
-                            week_done[act_w] = week_done.get(act_w, 0) + 1
-                            DAY_DONE[act_d] = DAY_DONE.get(act_d, 0) + 1
+                            already_in_items = any(str(x.get("id")) == str(unres_aid) and x.get("isRegister") for x in items)
+                            if not already_in_items:
+                                week_done[act_w] = week_done.get(act_w, 0) + 1
+                                DAY_DONE[act_d] = DAY_DONE.get(act_d, 0) + 1
                         EXTRA.append((act_w, activity_slot(it_for_quota), "已抢:" + unres_name))
                     except Exception:
                         pass
