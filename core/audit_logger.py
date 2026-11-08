@@ -25,12 +25,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class EventType:
-    """审计事件五大分类"""
+    """审计事件分类"""
     CANDIDATE = "candidate"
     SUBMISSION = "submission"
     VERIFICATION = "verification"
     RECONCILIATION = "reconciliation"
     INFRASTRUCTURE = "infrastructure"
+    CONFLICT = "conflict"
 
 
 class EventName:
@@ -70,6 +71,17 @@ class EventName:
     CIRCUIT_HALF_OPEN = "circuit_half_open"
     CIRCUIT_CLOSED = "circuit_closed"
     INFRASTRUCTURE_RECOVERED = "infrastructure_recovered"
+
+    # 6. Conflict Check 冲突检查与智能降级 (Phase 5)
+    CONFLICT_CHECK_STARTED = "conflict_check_started"
+    CONFLICT_CHECK_SUCCEEDED = "conflict_check_succeeded"
+    CONFLICT_CHECK_FAILED = "conflict_check_failed"
+    CONFLICT_CHECK_DEGRADED = "conflict_check_degraded"
+    LOCAL_CONFLICT_CHECK_STARTED = "local_conflict_check_started"
+    LOCAL_CONFLICT_CHECK_SUCCEEDED = "local_conflict_check_succeeded"
+    LOCAL_CONFLICT_DETECTED = "local_conflict_detected"
+    LOCAL_CONFLICT_CHECK_BLOCKED = "local_conflict_check_blocked"
+    CONFLICT_SERVICE_RECOVERED = "conflict_service_recovered"
 
 
 def sanitize_data(val: Any) -> Any:
@@ -141,7 +153,8 @@ class AuditLogger:
         request_id: Optional[str] = None,
         details: Optional[Dict] = None,
         timestamp: Optional[datetime.datetime] = None,
-        event_id: Optional[str] = None
+        event_id: Optional[str] = None,
+        run_id: Optional[str] = None
     ) -> Dict:
         """
         核心方法：记录一个符合统一 Schema (Version 1) 的审计事件。
@@ -158,7 +171,7 @@ class AuditLogger:
         record = {
             "schema_version": 1,
             "event_id": evt_id,
-            "run_id": self.run_id,
+            "run_id": run_id or self.run_id,
             "correlation_id": corr_id,
             "request_id": str(request_id) if request_id is not None else None,
             "timestamp": ts_iso,
@@ -395,6 +408,17 @@ class AuditLogReader:
         circuit_closed_count = 0
         outage_seconds_accumulated = 0.0
 
+        # 冲突检查与智能降级统计 (Phase 5)
+        conflict_check_started_count = 0
+        conflict_check_succeeded_count = 0
+        conflict_check_failed_count = 0
+        conflict_check_degraded_count = 0
+        local_conflict_check_started_count = 0
+        local_conflict_check_succeeded_count = 0
+        local_conflict_detected_count = 0
+        local_conflict_check_blocked_count = 0
+        conflict_service_recovered_count = 0
+
         runs_observed: Set[str] = set()
         correlations_observed: Set[str] = set()
 
@@ -498,6 +522,26 @@ class AuditLogReader:
                         except Exception:
                             pass
 
+            # 6. Conflict Check 冲突检查与智能降级
+            if ename == EventName.CONFLICT_CHECK_STARTED:
+                conflict_check_started_count += 1
+            elif ename == EventName.CONFLICT_CHECK_SUCCEEDED:
+                conflict_check_succeeded_count += 1
+            elif ename == EventName.CONFLICT_CHECK_FAILED:
+                conflict_check_failed_count += 1
+            elif ename == EventName.CONFLICT_CHECK_DEGRADED:
+                conflict_check_degraded_count += 1
+            elif ename == EventName.LOCAL_CONFLICT_CHECK_STARTED:
+                local_conflict_check_started_count += 1
+            elif ename == EventName.LOCAL_CONFLICT_CHECK_SUCCEEDED:
+                local_conflict_check_succeeded_count += 1
+            elif ename == EventName.LOCAL_CONFLICT_DETECTED:
+                local_conflict_detected_count += 1
+            elif ename == EventName.LOCAL_CONFLICT_CHECK_BLOCKED:
+                local_conflict_check_blocked_count += 1
+            elif ename == EventName.CONFLICT_SERVICE_RECOVERED:
+                conflict_service_recovered_count += 1
+
         unpaired_http_requests = len(started_request_ids - finished_request_ids)
         http_avg_duration_ms = round(sum(http_durations) / len(http_durations), 2) if http_durations else 0.0
         verification_avg_duration_ms = round(sum(verification_durations) / len(verification_durations), 2) if verification_durations else 0.0
@@ -550,5 +594,15 @@ class AuditLogReader:
             "circuit_trips": circuit_trips,
             "circuit_half_open_count": circuit_half_open_count,
             "circuit_closed_count": circuit_closed_count,
-            "outage_seconds": round(outage_seconds_accumulated, 2)
+            "outage_seconds": round(outage_seconds_accumulated, 2),
+            # Conflict Check (Phase 5)
+            "conflict_check_started_count": conflict_check_started_count,
+            "conflict_check_succeeded_count": conflict_check_succeeded_count,
+            "conflict_check_failed_count": conflict_check_failed_count,
+            "conflict_check_degraded_count": conflict_check_degraded_count,
+            "local_conflict_check_started_count": local_conflict_check_started_count,
+            "local_conflict_check_succeeded_count": local_conflict_check_succeeded_count,
+            "local_conflict_detected_count": local_conflict_detected_count,
+            "local_conflict_check_blocked_count": local_conflict_check_blocked_count,
+            "conflict_service_recovered_count": conflict_service_recovered_count
         }

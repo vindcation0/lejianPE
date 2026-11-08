@@ -43,6 +43,14 @@ from core.recovery_manager import RecoveryManager
 from core.reconciliation import ReconciliationManager
 from core.circuit_breaker import CircuitBreaker, CircuitState, is_server_fault
 from core.result_reporter import ResultReporter
+from core.conflict_checker import (
+    ConflictCircuitBreaker,
+    ConflictCircuitState,
+    ConflictCheckMode,
+    ConflictCheckResult,
+    LocalConflictChecker,
+    ConflictManager
+)
 
 BASE = "https://cpes.legym.cn/"
 STATE = os.path.join(ROOT, "state.json")
@@ -422,6 +430,14 @@ class Client:
         if code != 200 or not isinstance(obj, dict):
             return None
         return bool(obj.get("data"))
+
+    def check_conflict_detailed(self, activity_id, timeout=4):
+        code, obj = self.call("GET", "education/app/activity/checkConflict",
+                              {"activityId": activity_id}, timeout=timeout)
+        is_conflict = None
+        if code == 200 and isinstance(obj, dict):
+            is_conflict = bool(obj.get("data"))
+        return code, is_conflict, obj
 
     def sign_up(self, activity_id):
         code, obj = self.call("POST", "education/app/activity/signUp",
@@ -835,6 +851,23 @@ def _cmd_grab_inner(cfg, st):
     req_mgr = RequestManager(c, retry_policy, audit_logger=audit_logger)
     reg_mgr = RegistrationManager(state_store, req_mgr, audit_logger)
     recovery_mgr = RecoveryManager(state_store, req_mgr, audit_logger)
+    conflict_breaker = ConflictCircuitBreaker(
+        failure_threshold=3,
+        base_cooldown=2.0,
+        max_cooldown=30.0,
+        jitter_max=0.5,
+        audit_logger=audit_logger
+    )
+    local_conflict_checker = LocalConflictChecker()
+    conflict_manager = ConflictManager(
+        client=c,
+        breaker=conflict_breaker,
+        local_checker=local_conflict_checker,
+        audit_logger=audit_logger,
+        cfg=cfg,
+        tt=None,
+        state_store=state_store
+    )
 
     try:
         c.ensure_token()
@@ -885,10 +918,16 @@ def _cmd_grab_inner(cfg, st):
                 time.sleep(max(min(left, 1), 0.05))
 
     tt = load_timetable()
+    conflict_manager.tt = tt
     cw = current_week(tt)
     status_text, _, tw = get_semester_status(tt)
     if cw < 1 or cw > tw:
         log(f"[学期状态提示] 当前为第 {cw} 周（{status_text}），第一教学周为 {tt.get('week1_monday')}，学期总周数 {tw} 周。")
+    check_conf_cfg = cfg.get("check_conflict", True)
+    if check_conf_cfg:
+        log("  [配置模式] 冲突检查: 服务端优先 + 智能本地降级 (故障阈值: 3, 冷却基数: 2.0s)")
+    else:
+        log("  [配置模式] 冲突检查: 服务端检查已禁用 (check_conflict: false)，保持本地安全检查启用")
     busy = busy_for_week(cfg, tt, cw)
     log(f"第 {cw} 教学周，已占用 {len(busy)} 个时段：")
     for s, why in busy:
@@ -1104,15 +1143,19 @@ def _cmd_grab_inner(cfg, st):
                     cur_w_tot = reg_by_week.get(wk, 0) + week_done.get(wk, 0)
                     if cur_w_tot >= max_normal:
                         return False, f"当周普通活动已报满 {max_normal} 节"
-                if cfg.get("check_conflict", True):
-                    try:
-                        conf = c.check_conflict(act_item.get("id"))
-                        if conf is True:
-                            return False, "服务端判定冲突"
-                        elif conf is None:
-                            return False, "服务端冲突检查接口异常（结果未知，安全阻断）"
-                    except Exception as e:
-                        return False, f"服务端冲突检查调用异常: {e}"
+                # Phase 5: 冲突检查与智能降级
+                conf_ok, conf_reason = conflict_manager.check_activity_conflict(
+                    candidate=act_item,
+                    items=items,
+                    extra_slots=EXTRA,
+                    day_done=DAY_DONE,
+                    week_done=week_done,
+                    correlation_id=f"corr_grab_{aid}_{int(time.time()*1000)}",
+                    run_id=audit_logger.run_id if audit_logger else None,
+                    current_week=wk
+                )
+                if not conf_ok:
+                    return False, conf_reason
                 return True, "OK"
 
             ok, final_status, reason, final_item = reg_mgr.register_activity(

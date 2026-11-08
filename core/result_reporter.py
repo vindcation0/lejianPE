@@ -118,6 +118,18 @@ class ResultReporter:
         self.local_retryable_count = 0
         self.local_unresolved_records: List[Dict] = []
 
+        # ---------------- H. 冲突检查与智能降级 (Conflict Check, Phase 5) ----------------
+        self.conflict_check_started_count = 0
+        self.conflict_check_succeeded_count = 0
+        self.conflict_check_failed_count = 0
+        self.conflict_check_degraded_count = 0
+        self.local_conflict_check_started_count = 0
+        self.local_conflict_check_succeeded_count = 0
+        self.local_conflict_detected_count = 0
+        self.local_conflict_check_blocked_count = 0
+        self.conflict_service_recovered_count = 0
+        self.conflict_failure_counts = collections.Counter()
+
     # =========================================================================
     # 数据注入与绑定接口
     # =========================================================================
@@ -189,6 +201,21 @@ class ResultReporter:
         self.breaker_recoveries = summary.get("circuit_closed_count", 0)
         if summary.get("outage_seconds") is not None:
             self.outage_seconds = float(summary.get("outage_seconds"))
+
+        # 冲突检查与智能降级指标 (Phase 5)
+        self.conflict_check_started_count = summary.get("conflict_check_started_count", 0)
+        self.conflict_check_succeeded_count = summary.get("conflict_check_succeeded_count", 0)
+        self.conflict_check_failed_count = summary.get("conflict_check_failed_count", 0)
+        self.conflict_check_degraded_count = summary.get("conflict_check_degraded_count", 0)
+        self.local_conflict_check_started_count = summary.get("local_conflict_check_started_count", 0)
+        self.local_conflict_check_succeeded_count = summary.get("local_conflict_check_succeeded_count", 0)
+        self.local_conflict_detected_count = summary.get("local_conflict_detected_count", 0)
+        self.local_conflict_check_blocked_count = summary.get("local_conflict_check_blocked_count", 0)
+        self.conflict_service_recovered_count = summary.get("conflict_service_recovered_count", 0)
+
+    def record_conflict_failure(self, http_code: int):
+        """独立记录 checkConflict 的 HTTP 失败，绝不混入 activities 列表失败统计 (C23)"""
+        self.conflict_failure_counts[int(http_code)] += 1
 
     def set_reconciliation_result(
         self,
@@ -557,6 +584,20 @@ class ResultReporter:
                 "has_unresolved": self.uncertain_count > 0 or self.local_unknown_count > 0,
                 "has_write_errors": self.write_error_count > 0,
                 "reconciliation_failed": not self.reconciliation_success if self.reconciliation_performed else True
+            },
+
+            # 冲突检查与智能降级 (Conflict Check, Phase 5)
+            "conflict_check": {
+                "started": self.conflict_check_started_count,
+                "succeeded": self.conflict_check_succeeded_count,
+                "failed": self.conflict_check_failed_count,
+                "degraded": self.conflict_check_degraded_count,
+                "local_started": self.local_conflict_check_started_count,
+                "local_succeeded": self.local_conflict_check_succeeded_count,
+                "local_detected": self.local_conflict_detected_count,
+                "local_blocked": self.local_conflict_check_blocked_count,
+                "recovered": self.conflict_service_recovered_count,
+                "failures_breakdown": dict(self.conflict_failure_counts)
             },
 
             # 最终结论 (Verdict)
