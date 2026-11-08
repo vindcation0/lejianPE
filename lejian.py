@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -34,7 +35,7 @@ if ROOT not in sys.path:
 
 from core.instance_lock import InstanceLock, InstanceLockError
 from core.state_store import StateStore, RegistrationStatus, StateStoreError
-from core.audit_logger import AuditLogger
+from core.audit_logger import AuditLogger, AuditLogReader
 from core.retry_policy import RetryPolicy, HealthState
 from core.request_manager import RequestManager, SubmitResult
 from core.registration_manager import RegistrationManager
@@ -113,13 +114,17 @@ def log(msg):
 
 # ---------------------------------------------------------------- HTTP
 def _request(method, path, params=None, body=None, form=False, auth=True,
-             token=None, school_id=None, timeout=15, audit_logger=None):
+             token=None, school_id=None, timeout=15, audit_logger=None,
+             correlation_id=None, request_id=None):
+    req_id = request_id or f"req_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
     t_start = time.time()
     if audit_logger and hasattr(audit_logger, "record_event"):
         try:
             audit_logger.record_event(
                 event_type="infrastructure",
                 event_name="http_request_started",
+                request_id=req_id,
+                correlation_id=correlation_id,
                 source="client_http",
                 details={"method": method, "path": path}
             )
@@ -160,6 +165,8 @@ def _request(method, path, params=None, body=None, form=False, auth=True,
                 audit_logger.record_event(
                     event_type="infrastructure",
                     event_name="http_request_succeeded",
+                    request_id=req_id,
+                    correlation_id=correlation_id,
                     http_status=200,
                     duration_ms=dur_ms,
                     source="client_http",
@@ -169,6 +176,8 @@ def _request(method, path, params=None, body=None, form=False, auth=True,
                 audit_logger.record_event(
                     event_type="infrastructure",
                     event_name="http_request_failed",
+                    request_id=req_id,
+                    correlation_id=correlation_id,
                     http_status=status_code,
                     duration_ms=dur_ms,
                     reason=resp_text[:200] if isinstance(resp_text, str) else repr(resp_text)[:200],
@@ -820,7 +829,9 @@ def _cmd_grab_inner(cfg, st):
     c = Client(st, audit_logger=audit_logger)
     retry_policy = RetryPolicy(base_delay=0.5, max_delay=8.0)
     circuit_breaker = CircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0, audit_logger=audit_logger)
-    reporter = ResultReporter(run_date=datetime.date.today())
+    reporter = ResultReporter(run_date=datetime.date.today(), run_id=audit_logger.run_id)
+    reporter.bind_audit_logger(audit_logger)
+    reporter.set_local_state_store(state_store)
     req_mgr = RequestManager(c, retry_policy, audit_logger=audit_logger)
     reg_mgr = RegistrationManager(state_store, req_mgr, audit_logger)
     recovery_mgr = RecoveryManager(state_store, req_mgr, audit_logger)
@@ -1143,6 +1154,17 @@ def _cmd_grab_inner(cfg, st):
     unresolved_cnt = len(state_store.get_unresolved_records())
     cb_metrics = circuit_breaker.get_metrics()
 
+    # 从统一审计日志回放权威运行指标
+    try:
+        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        evt_path = audit_logger._get_event_path(today_str)
+        run_events = AuditLogReader.read_events_from_file(evt_path)
+        audit_summary = AuditLogReader.replay(run_events, run_id=audit_logger.run_id)
+        reporter.set_audit_summary(audit_summary)
+    except Exception as e:
+        log(f"[审计回放提示] 读取当前运行事件回放失败: {e}")
+
+    reporter.set_local_state_store(state_store)
     reporter.current_week = cw
     reporter.set_circuit_metrics(
         outage_seconds=cb_metrics["total_outage_seconds"],
@@ -1156,7 +1178,8 @@ def _cmd_grab_inner(cfg, st):
         special_registered=report.get("special_registered", special_done),
         max_per_day=int(cfg.get("max_per_day", 1)),
         weekly_exceeded=bool(report.get("exceeded_weeks")),
-        daily_exceeded=bool(report.get("exceeded_days"))
+        daily_exceeded=bool(report.get("exceeded_days")),
+        reconciliation_report=report
     )
 
     # 控制台多段式统一报告 (5.4, 5.6)

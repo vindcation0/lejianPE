@@ -125,13 +125,14 @@ class AuditLogger:
         duration_ms: Optional[float] = None,
         source: str = "core",
         correlation_id: Optional[str] = None,
+        request_id: Optional[str] = None,
         details: Optional[Dict] = None,
         timestamp: Optional[datetime.datetime] = None,
         event_id: Optional[str] = None
     ) -> Dict:
         """
         核心方法：记录一个符合统一 Schema (Version 1) 的审计事件。
-        自动脱敏、分配唯一 event_id、关联 run_id 与 correlation_id。
+        自动脱敏、分配唯一 event_id、关联 run_id 与 correlation_id、request_id。
         """
         self._seq += 1
         ts = timestamp or datetime.datetime.now()
@@ -146,6 +147,7 @@ class AuditLogger:
             "event_id": evt_id,
             "run_id": self.run_id,
             "correlation_id": corr_id,
+            "request_id": str(request_id) if request_id is not None else None,
             "timestamp": ts_iso,
             "event_type": str(event_type),
             "event_name": str(event_name),
@@ -271,6 +273,8 @@ class AuditLogReader:
 
             # 若为 Schema v1 标准格式
             if "schema_version" in data and "event_type" in data:
+                if "request_id" not in data:
+                    data["request_id"] = None
                 return data
 
             # 若为旧版事件格式: {"t": "...", "event": "...", ...}
@@ -282,6 +286,7 @@ class AuditLogReader:
                 "event_id": data.get("event_id") or f"legacy_{hash(raw)}",
                 "run_id": data.get("run_id") or "legacy_run",
                 "correlation_id": data.get("correlation_id") or data.get("event_id") or "legacy_corr",
+                "request_id": data.get("request_id"),
                 "timestamp": legacy_t,
                 "event_type": EventType.INFRASTRUCTURE if ("fail" in legacy_evt or "list" in legacy_evt) else EventType.SUBMISSION,
                 "event_name": legacy_evt,
@@ -337,6 +342,8 @@ class AuditLogReader:
         candidate_count = 0
         candidate_rejected = 0
         candidate_accepted = 0
+        candidate_blocked = 0
+        candidate_reasons = collections.Counter()
 
         # Submission (仅当实际调用 submit_once 时产生)
         submission_started_count = 0
@@ -349,6 +356,7 @@ class AuditLogReader:
         verification_confirmed_registered_count = 0
         verification_confirmed_unregistered_count = 0
         verification_remains_unknown_count = 0
+        verification_durations: List[float] = []
 
         # Reconciliation
         reconciliation_started_count = 0
@@ -360,11 +368,17 @@ class AuditLogReader:
         http_requests_succeeded = 0
         http_requests_failed = 0
         http_failures_by_code = collections.Counter()
+        http_durations: List[float] = []
+
+        # 请求级关联与配对跟踪 (request_id)
+        started_request_ids: Set[str] = set()
+        finished_request_ids: Set[str] = set()
 
         # 熔断器状态切换
         circuit_trips = 0
         circuit_half_open_count = 0
         circuit_closed_count = 0
+        outage_seconds_accumulated = 0.0
 
         runs_observed: Set[str] = set()
         correlations_observed: Set[str] = set()
@@ -374,18 +388,32 @@ class AuditLogReader:
             ename = evt.get("event_name")
             rid = evt.get("run_id")
             cid = evt.get("correlation_id")
+            req_id = evt.get("request_id")
             code = evt.get("http_status")
+            dur = evt.get("duration_ms")
+            reas = evt.get("reason")
 
             if rid:
                 runs_observed.add(rid)
             if cid:
                 correlations_observed.add(cid)
 
+            # 请求级配对跟踪
+            if req_id:
+                if ename == EventName.HTTP_REQUEST_STARTED:
+                    started_request_ids.add(req_id)
+                elif ename in (EventName.HTTP_REQUEST_SUCCEEDED, EventName.HTTP_REQUEST_FAILED):
+                    finished_request_ids.add(req_id)
+
             # 1. Candidate 候选评估
             if etype == EventType.CANDIDATE:
                 candidate_count += 1
                 if ename == EventName.CANDIDATE_REJECTED:
                     candidate_rejected += 1
+                    r_str = str(reas or "规则拦截")
+                    candidate_reasons[r_str] += 1
+                    if any(k in r_str for k in ("屏障", "上限", "满额", "已满", "冻结")):
+                        candidate_blocked += 1
                 elif ename == EventName.CANDIDATE_ACCEPTED:
                     candidate_accepted += 1
 
@@ -402,6 +430,11 @@ class AuditLogReader:
 
             # 3. Verification 服务端复核
             elif etype == EventType.VERIFICATION:
+                if dur is not None:
+                    try:
+                        verification_durations.append(float(dur))
+                    except Exception:
+                        pass
                 if ename == EventName.VERIFICATION_STARTED:
                     verification_started_count += 1
                 elif ename == EventName.VERIFICATION_CONFIRMED_REGISTERED:
@@ -422,6 +455,12 @@ class AuditLogReader:
 
             # 5. Infrastructure
             elif etype == EventType.INFRASTRUCTURE:
+                if dur is not None and ename in (EventName.HTTP_REQUEST_SUCCEEDED, EventName.HTTP_REQUEST_FAILED):
+                    try:
+                        http_durations.append(float(dur))
+                    except Exception:
+                        pass
+
                 if ename == EventName.HTTP_REQUEST_STARTED:
                     http_requests_total += 1
                 elif ename == EventName.HTTP_REQUEST_SUCCEEDED:
@@ -436,6 +475,17 @@ class AuditLogReader:
                     circuit_half_open_count += 1
                 elif ename in (EventName.CIRCUIT_CLOSED, EventName.INFRASTRUCTURE_RECOVERED, "list_ok"):
                     circuit_closed_count += 1
+                    det = evt.get("details") or {}
+                    outage_sec = det.get("outage_sec") or det.get("outage_seconds")
+                    if outage_sec is not None:
+                        try:
+                            outage_seconds_accumulated += float(outage_sec)
+                        except Exception:
+                            pass
+
+        unpaired_http_requests = len(started_request_ids - finished_request_ids)
+        http_avg_duration_ms = round(sum(http_durations) / len(http_durations), 2) if http_durations else 0.0
+        verification_avg_duration_ms = round(sum(verification_durations) / len(verification_durations), 2) if verification_durations else 0.0
 
         return {
             "total_events": len(deduped_events),
@@ -446,6 +496,8 @@ class AuditLogReader:
             "candidate_count": candidate_count,
             "candidate_accepted": candidate_accepted,
             "candidate_rejected": candidate_rejected,
+            "candidate_blocked": candidate_blocked,
+            "candidate_reasons": dict(candidate_reasons),
             # Submission (真实提交)
             "submission_started_count": submission_started_count,
             "submission_succeeded_count": submission_succeeded_count,
@@ -456,6 +508,7 @@ class AuditLogReader:
             "verification_confirmed_registered_count": verification_confirmed_registered_count,
             "verification_confirmed_unregistered_count": verification_confirmed_unregistered_count,
             "verification_remains_unknown_count": verification_remains_unknown_count,
+            "verification_avg_duration_ms": verification_avg_duration_ms,
             # Reconciliation
             "reconciliation_started_count": reconciliation_started_count,
             "reconciliation_succeeded_count": reconciliation_succeeded_count,
@@ -465,8 +518,15 @@ class AuditLogReader:
             "http_requests_succeeded": http_requests_succeeded,
             "http_requests_failed": http_requests_failed,
             "http_failures_by_code": dict(http_failures_by_code),
+            "http_avg_duration_ms": http_avg_duration_ms,
+            "timeout_count": http_failures_by_code.get(-1, 0),
+            "network_error_count": sum(cnt for c, cnt in http_failures_by_code.items() if c < 0 or c >= 500),
+            # Request ID & Audit Integrity
+            "unpaired_http_requests": unpaired_http_requests,
+            "audit_degraded": bool(unpaired_http_requests > 0),
             # Circuit breaker
             "circuit_trips": circuit_trips,
             "circuit_half_open_count": circuit_half_open_count,
-            "circuit_closed_count": circuit_closed_count
+            "circuit_closed_count": circuit_closed_count,
+            "outage_seconds": round(outage_seconds_accumulated, 2)
         }
