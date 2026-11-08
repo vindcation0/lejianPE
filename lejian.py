@@ -283,8 +283,21 @@ class Client:
             except Exception:
                 pass
 
-    def activities(self, page_size=200, req_timeout=6, max_retries=1):
-        """一次拉 200 条，分页拉取全部活动并跟踪分页完整性与状态码"""
+    def activities(self, page_size=200, req_timeout=6, max_retries=0, max_attempts=None):
+        """
+        一次拉 200 条，分页拉取全部活动并跟踪分页完整性与状态码。
+
+        参数语义规范:
+        - max_retries: 失败后的额外重试次数。默认 0（即仅首次请求 1 次，不进行额外重试）。
+          - max_retries=0: 允许，总共发起 1 次 HTTP 请求（1 首次 + 0 重试）。
+          - max_retries=1: 允许，总共最多发起 2 次 HTTP 请求（1 首次 + 1 重试）。
+        - max_attempts: 总尝试次数别名（若显式指定则优先使用：total_attempts = max(1, max_attempts)）。
+        """
+        if max_attempts is not None:
+            total_attempts = max(1, int(max_attempts))
+        else:
+            total_attempts = 1 + max(0, int(max_retries))
+
         out, page = [], 1
         total = 0
         complete = True
@@ -293,14 +306,14 @@ class Client:
 
         while page <= 10:
             code, obj = None, None
-            for _ in range(max_retries):
+            for attempt_idx in range(total_attempts):
                 code, obj = self.call("POST", "education/app/activity/getActivityList",
                                       {"state": 1, "page": page, "size": page_size,
                                        "semesterId": self.s["semesterId"]},
                                        timeout=req_timeout)
                 if code == 200 and isinstance(obj, dict) and obj.get("code") == 0:
                     break
-                if max_retries > 1:
+                if attempt_idx < total_attempts - 1:
                     time.sleep(0.25)
             if code != 200 or not isinstance(obj, dict) or obj.get("code") != 0:
                 self._note_fail(code)
@@ -823,7 +836,7 @@ def _cmd_grab_inner(cfg, st):
 
         try:
             c.ensure_token(300)
-            items = c.activities(page_size=200, req_timeout=6, max_retries=1)
+            items = c.activities(page_size=200, req_timeout=6, max_retries=0)
         except Exception as e:
             # 记录故障分类与熔断 (C01, C02)
             http_code = getattr(e, "code", -1) if hasattr(e, "code") else -1
@@ -851,9 +864,33 @@ def _cmd_grab_inner(cfg, st):
                     f"退避 {backoff_delay:.2f} 秒")
                 retry_policy.sleep_backoff()
                 continue
+            elif http_code == 401:
+                # 401 未授权 / Token 失效：不计入基础设施故障，交给 Token 刷新机制处理
+                circuit_breaker.record_failure(http_status=401)
+                reporter.record_http_failure(401)
+                log(f"  [认证异常] 活动列表返回 HTTP 401 (Token 失效)，尝试触发刷新...")
+                try:
+                    c.refresh()
+                except Exception as ref_err:
+                    log(f"  [认证异常] Token 刷新失败: {ref_err}")
+                time.sleep(1)
+                continue
+            elif http_code == 403:
+                # 403 禁止访问：不计入基础设施故障，明确提示权限异常
+                circuit_breaker.record_failure(http_status=403)
+                reporter.record_http_failure(403)
+                log(f"  [权限异常] 活动列表返回 HTTP 403 (禁止访问/权限不足): {err_msg}")
+                time.sleep(poll)
+                continue
+            elif http_code == 400:
+                # 400 请求参数错误：不计入基础设施故障
+                circuit_breaker.record_failure(http_status=400)
+                reporter.record_http_failure(400)
+                log(f"  [参数异常] 活动列表返回 HTTP 400 (请求参数错误): {err_msg}")
+                time.sleep(poll)
+                continue
             else:
-                # 客户端异常 (401, 403, 400) 或纯数据残缺
-                # 在 HALF_OPEN 状态下，数据不完整或非健康探测必须重新 OPEN (C09)
+                # 纯数据残缺 (例如分页截断或 HTTP 200 数据不完整)
                 circuit_breaker.record_success(is_complete=False)
                 if http_code is not None and http_code != 200:
                     reporter.record_http_failure(http_code)

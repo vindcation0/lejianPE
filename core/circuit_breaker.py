@@ -135,15 +135,20 @@ class CircuitBreaker:
         """
         记录请求失败。
         对故障进行严格分类，仅在服务端基础设施故障时累加失败计数并触发熔断。
-        在 HALF_OPEN 状态下，任何探测失败均立即重新进入 OPEN。
+        - 4xx (401, 403, 400 等) 属于客户端错误，严禁计入基础设施故障计数。
+        - 在 HALF_OPEN 探测期间，若遇到 4xx 客户端错误，释放探测锁并保持 HALF_OPEN，
+          允许外部进行认证刷新或参数修复后重新探测，严禁将其当作服务端崩溃而递增退避冷却。
+        - 仅在 HALF_OPEN 遇到真实基础设施故障 (5xx / 超时) 时，才重新切入 OPEN 并递增退避。
         """
-        if self.state == CircuitState.HALF_OPEN:
-            # HALF_OPEN 探测未成功，必须重新进入 OPEN，绝不允许在 HALF_OPEN 挂起
-            self._trip_to_open(reason=f"HALF_OPEN 探测失败 (http={http_status}, err={error})")
+        if not force_trip and not is_server_fault(http_status=http_status, error=error):
+            # 业务错误或客户端错误 (401, 403, 400) 不计入基础设施熔断
+            # 若处于 HALF_OPEN，释放探测锁，保持 HALF_OPEN 允许认证修复后重新发起探测
+            self._half_open_probe_in_progress = False
             return self.state
 
-        if not force_trip and not is_server_fault(http_status=http_status, error=error):
-            # 业务错误（如名额已满）或客户端错误 (401, 403, 400) 不计入基础设施熔断
+        if self.state == CircuitState.HALF_OPEN:
+            # HALF_OPEN 探测遭遇真实基础设施故障，重新进入 OPEN 并增加退避
+            self._trip_to_open(reason=f"HALF_OPEN 探测失败 (http={http_status}, err={error})")
             return self.state
 
         self.failure_count += 1

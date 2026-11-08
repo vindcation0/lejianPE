@@ -300,9 +300,9 @@ class CircuitBreakerTestSuite(unittest.TestCase):
 
         client.call = mock_call
 
-        # 执行一次包含内部 3 次重试的 activities 调用
-        items = client.activities(page_size=200, max_retries=3)
-        self.assertEqual(call_count, 3)  # 内部尝试了 3 次
+        # 执行一次包含内部 2 次重试 (总共 3 次尝试) 的 activities 调用
+        items = client.activities(page_size=200, max_retries=2)
+        self.assertEqual(call_count, 3)  # 内部尝试了 3 次 (1 首次 + 2 重试)
         self.assertFalse(items.complete)
         self.assertEqual(items.http_code, 500)
 
@@ -327,6 +327,183 @@ class CircuitBreakerTestSuite(unittest.TestCase):
             st = self.breaker.record_success(is_complete=True)
             self.assertEqual(st, CircuitState.CLOSED)
             self.assertEqual(self.breaker.failure_count, 0)
+
+    # =========================================================================
+    # Phase 1 补充验收测试 (C24～C30)：熔断器边界条件与重试语义核实
+    # =========================================================================
+
+    def test_C24_half_open_http_401_releases_probe_lock_and_preserves_cooldown(self):
+        """C24: HALF_OPEN 状态下遇到 401，严禁计入基础设施故障，释放探测锁并保持退避时间不变"""
+        self.breaker.record_failure(http_status=500, force_trip=True)
+        self.assertEqual(self.breaker.state, CircuitState.OPEN)
+        expected_cooldown = self.breaker.current_cooldown
+        expected_trips = self.breaker.trip_count
+        expected_failures = self.breaker.failure_count
+
+        time.sleep(0.15)
+        can, msg = self.breaker.can_attempt()
+        self.assertTrue(can)
+        self.assertEqual(self.breaker.state, CircuitState.HALF_OPEN)
+        self.assertTrue(self.breaker._half_open_probe_in_progress)
+
+        # 探测遇到 401（Token 过期）
+        st = self.breaker.record_failure(http_status=401)
+        # 核心断言：
+        # 1. 状态保持 HALF_OPEN，严禁被误置为 CLOSED，也不被当作基础设施故障切入 OPEN
+        self.assertEqual(st, CircuitState.HALF_OPEN)
+        # 2. 基础设施故障计数严禁增加
+        self.assertEqual(self.breaker.failure_count, expected_failures)
+        # 3. trip_count 严禁增加
+        self.assertEqual(self.breaker.trip_count, expected_trips)
+        # 4. 退避冷却时间严禁被指数倍增
+        self.assertEqual(self.breaker.current_cooldown, expected_cooldown)
+        # 5. 必须释放单次探测锁，避免永久挂起
+        self.assertFalse(self.breaker._half_open_probe_in_progress)
+
+        # 6. 探测锁释放后，再次调用 can_attempt 应当立即允许重新探测（等待 Token 刷新）
+        can_next, _ = self.breaker.can_attempt()
+        self.assertTrue(can_next)
+
+    def test_C25_half_open_http_403_and_400_not_classified_as_server_fault(self):
+        """C25: HALF_OPEN 状态下遇到 403 / 400，释放探测锁，不增加故障计数，不增加退避"""
+        self.breaker.record_failure(http_status=500, force_trip=True)
+        time.sleep(0.15)
+        self.breaker.can_attempt()
+        self.assertEqual(self.breaker.state, CircuitState.HALF_OPEN)
+        expected_failures = self.breaker.failure_count
+
+        # 403 禁止访问
+        st403 = self.breaker.record_failure(http_status=403)
+        self.assertEqual(st403, CircuitState.HALF_OPEN)
+        self.assertEqual(self.breaker.failure_count, expected_failures)
+        self.assertFalse(self.breaker._half_open_probe_in_progress)
+
+        # 再次获取探测机会测试 400
+        self.breaker.can_attempt()
+        st400 = self.breaker.record_failure(http_status=400)
+        self.assertEqual(st400, CircuitState.HALF_OPEN)
+        self.assertEqual(self.breaker.failure_count, expected_failures)
+        self.assertFalse(self.breaker._half_open_probe_in_progress)
+
+    def test_C26_half_open_401_recovers_to_closed_after_reauth_probe(self):
+        """C26: HALF_OPEN 遇到 401 后完成重认证，再次健康探测成功且列表完整时平滑恢复 CLOSED"""
+        from lejian import ActivityList
+
+        self.breaker.record_failure(http_status=500, force_trip=True)
+        time.sleep(0.15)
+        self.breaker.can_attempt()
+        self.assertEqual(self.breaker.state, CircuitState.HALF_OPEN)
+
+        # 第 1 次探测：401 失败
+        self.breaker.record_failure(http_status=401)
+        self.assertEqual(self.breaker.state, CircuitState.HALF_OPEN)
+
+        # 外部执行认证刷新后，第 2 次发起健康探测
+        can, _ = self.breaker.can_attempt()
+        self.assertTrue(can)
+
+        # 探测成功获得完整列表
+        probe_items = ActivityList([{"id": "act_1"}], complete=True, total=1, fetched=1)
+        st = self.breaker.record_success(is_complete=probe_items.complete)
+        self.assertEqual(st, CircuitState.CLOSED)
+        self.assertEqual(self.breaker.failure_count, 0)
+
+        # 恢复后正常请求畅通
+        can_normal, _ = self.breaker.can_attempt()
+        self.assertTrue(can_normal)
+
+    def test_C27_client_errors_do_not_cause_infinite_backoff(self):
+        """C27: 连续客户端异常 (401/403/400) 绝不会导致 trip_count 累加或冷却时间无限增长"""
+        self.breaker.record_failure(http_status=500, force_trip=True)
+        time.sleep(0.15)
+        self.breaker.can_attempt()
+        self.assertEqual(self.breaker.state, CircuitState.HALF_OPEN)
+
+        init_trip_count = self.breaker.trip_count
+        init_cooldown = self.breaker.current_cooldown
+        init_failures = self.breaker.failure_count
+
+        # 模拟 10 次由于凭据或参数异常引起的失败响应
+        for code in (401, 403, 400, 401, 403, 400, 401, 403, 400, 401):
+            st = self.breaker.record_failure(http_status=code)
+            self.assertEqual(st, CircuitState.HALF_OPEN)
+            # 释放锁后允许下一次尝试
+            can, _ = self.breaker.can_attempt()
+            self.assertTrue(can)
+
+        # 核心断言：退避次数和冷却时间完全没有因客户端异常而恶化
+        self.assertEqual(self.breaker.trip_count, init_trip_count)
+        self.assertEqual(self.breaker.current_cooldown, init_cooldown)
+        self.assertEqual(self.breaker.failure_count, init_failures)
+
+    def test_C28_activities_max_retries_zero_executes_single_http_call(self):
+        """C28: activities(max_retries=0) 语义测试：允许且仅发起 1 次 HTTP 请求（0 次额外重试）"""
+        from lejian import Client
+
+        client = Client({"semesterId": "sem1", "schoolId": "sch1", "accessToken": "tok"})
+        call_count = 0
+
+        def mock_call(method, path, body=None, timeout=6):
+            nonlocal call_count
+            call_count += 1
+            return 500, "Internal Server Error"
+
+        client.call = mock_call
+
+        items = client.activities(page_size=200, max_retries=0)
+        # 核心断言：调用次数严格等于 1
+        self.assertEqual(call_count, 1)
+        self.assertFalse(items.complete)
+        self.assertEqual(items.http_code, 500)
+
+    def test_C29_activities_max_retries_one_executes_two_http_calls_on_failure(self):
+        """C29: activities(max_retries=1) 语义测试：失败时发起 2 次 HTTP 请求（1 次首次 + 1 次重试）"""
+        from lejian import Client
+
+        client = Client({"semesterId": "sem1", "schoolId": "sch1", "accessToken": "tok"})
+        call_count = 0
+
+        def mock_call(method, path, body=None, timeout=6):
+            nonlocal call_count
+            call_count += 1
+            return 500, "Internal Server Error"
+
+        client.call = mock_call
+
+        items = client.activities(page_size=200, max_retries=1)
+        # 核心断言：1 首次 + 1 重试 = 2 次
+        self.assertEqual(call_count, 2)
+        self.assertFalse(items.complete)
+        self.assertEqual(items.http_code, 500)
+
+    def test_C30_main_grab_polling_mock_http_call_count_exact_match(self):
+        """C30: 主抢课轮询单次轮询在故障时底层 HTTP 调用次数严格为 1，与熔断统计严格 1:1 对齐"""
+        from lejian import Client, is_server_fault
+
+        client = Client({"semesterId": "sem1", "schoolId": "sch1", "accessToken": "tok"})
+        http_calls = 0
+
+        def mock_call(method, path, body=None, timeout=6):
+            nonlocal http_calls
+            http_calls += 1
+            return 502, "Bad Gateway"
+
+        client.call = mock_call
+
+        # 主抢课循环标准调用：max_retries=0
+        items = client.activities(page_size=200, req_timeout=6, max_retries=0)
+        # 底层 HTTP 调用严格为 1
+        self.assertEqual(http_calls, 1)
+
+        # 主循环根据返回结果驱动熔断器
+        if not getattr(items, "complete", True):
+            code = getattr(items, "http_code", None)
+            if code is not None and is_server_fault(code):
+                self.breaker.record_failure(http_status=code, error=Exception(items.error))
+
+        # 熔断器统计次数也严格为 1，完全 1:1，无任何重复累计或隐式重试
+        self.assertEqual(self.breaker.failure_count, 1)
+        self.assertEqual(self.breaker.state, CircuitState.CLOSED)
 
 
 if __name__ == "__main__":
