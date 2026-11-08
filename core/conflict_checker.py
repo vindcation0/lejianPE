@@ -72,6 +72,34 @@ class ConflictCheckResult:
         return f"<ConflictCheckResult mode={self.mode} status={self.status} conflict={self.has_conflict} reason={self.reason!r}>"
 
 
+class ActivityList(list):
+    """
+    带有分页完整性元数据与状态码的活动列表。
+    继承自内置 list，保证 100% 向后兼容所有以列表方式消费 activity 的调用。
+    """
+    def __init__(
+        self,
+        items=None,
+        complete=True,
+        total=0,
+        fetched=0,
+        error=None,
+        http_code=200,
+        fetched_at=None,
+        run_id=None,
+        source="getActivityList"
+    ):
+        super().__init__(items or [])
+        self.complete = bool(complete)
+        self.total = int(total)
+        self.fetched = int(fetched)
+        self.error = error
+        self.http_code = http_code
+        self.fetched_at = fetched_at if fetched_at is not None else time.time()
+        self.run_id = run_id
+        self.source = source
+
+
 class ConflictCircuitBreaker:
     """
     checkConflict 专属独立故障熔断器。
@@ -325,7 +353,9 @@ class LocalConflictChecker:
         items: Any,
         state_store: Optional[StateStore] = None,
         tt: Optional[Dict] = None,
-        reconciliation_in_progress: bool = False
+        reconciliation_in_progress: bool = False,
+        current_run_id: Optional[str] = None,
+        max_snapshot_age_sec: float = 60.0
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         任务三：本地数据完整性检查。
@@ -333,7 +363,9 @@ class LocalConflictChecker:
         """
         details: Dict[str, Any] = {
             "items_present": items is not None,
+            "has_complete_attr": False,
             "items_complete": False,
+            "has_fetched_at": False,
             "candidate_valid": False,
             "registered_times_valid": True,
             "unresolved_count": 0,
@@ -362,17 +394,57 @@ class LocalConflictChecker:
             return False, f"候选活动课程类型未知或不可识别: {c_type}", details
 
         # 4. 已报名课程列表获取成功与类型检查
-        if items is None or not isinstance(items, (list, tuple)):
-            return False, "已报名课程列表获取失败或数据格式非法", details
+        if items is None:
+            return False, "已报名课程列表为空 (None)，无法确认真实报名状态", details
+        if not isinstance(items, (list, tuple)):
+            return False, "已报名课程列表格式错误 (非列表结构)", details
 
-        # 5. 分页完整性检查 (complete 属性)
-        is_complete = getattr(items, "complete", True)
+        # 5. 分页完整性检查 (complete 属性必须明确存在，且不能为默认推断) (Task 1 & 2: C27, C28, C30)
+        if not hasattr(items, "complete"):
+            details["has_complete_attr"] = False
+            return False, "活动列表缺失 complete 完整性标记证据 (缺少 complete 属性)，禁止推断完整性", details
+        details["has_complete_attr"] = True
+        is_complete = getattr(items, "complete")
         details["items_complete"] = bool(is_complete)
         if not is_complete:
             err_msg = getattr(items, "error", "") or "列表分页残缺"
-            return False, f"已报名课程列表数据不完整: {err_msg}", details
+            return False, f"已报名课程列表分页不完整 (complete=False): {err_msg}", details
 
-        # 6. 每条已报课程的时间信息有效性检查
+        # 6. 本地数据快照新鲜度与有效期检查 (Task 3: C31, C32, C33)
+        if not hasattr(items, "fetched_at") or getattr(items, "fetched_at") is None:
+            details["has_fetched_at"] = False
+            return False, "本地数据快照缺失新鲜度标记证据 (缺少 fetched_at 时间戳)", details
+        details["has_fetched_at"] = True
+        fetched_at = float(getattr(items, "fetched_at"))
+        details["fetched_at"] = fetched_at
+        elapsed_sec = time.time() - fetched_at
+        details["snapshot_age_sec"] = round(elapsed_sec, 2)
+        if elapsed_sec > max_snapshot_age_sec:
+            return False, f"本地报名数据超过有效期 (已获取 {elapsed_sec:.1f}s，超过上限 {max_snapshot_age_sec}s)，安全阻断", details
+        if elapsed_sec < -5.0:
+            return False, f"本地报名数据时间戳异常 (未来时间 {fetched_at})，安全阻断", details
+
+        # 6.2 run_id 匹配检查 (C32)
+        items_run_id = getattr(items, "run_id", None)
+        details["snapshot_run_id"] = items_run_id
+        details["current_run_id"] = current_run_id
+        if current_run_id is not None and items_run_id is not None:
+            if str(items_run_id) != str(current_run_id):
+                return False, f"本地数据快照 run_id 不匹配 (快照 run_id={items_run_id}, 当前 run_id={current_run_id})，禁止跨运行盲目复用", details
+
+        # 6.3 数据快照获取后的本地状态变更检查 (C33)
+        if state_store is not None:
+            for rec in state_store.get_all_records():
+                up_str = rec.get("updated_at")
+                if up_str:
+                    try:
+                        up_dt = datetime.datetime.fromisoformat(up_str)
+                        if up_dt.timestamp() > fetched_at:
+                            return False, f"本地数据获取后状态发生变化 (活动 {rec.get('activity_id')} 于 {up_str} 发生状态变更)，必须重新刷新数据", details
+                    except Exception:
+                        pass
+
+        # 7. 每条已报课程的时间信息有效性检查
         for it in items:
             if not isinstance(it, dict):
                 return False, "课程列表包含非字典格式数据", details
@@ -387,7 +459,7 @@ class LocalConflictChecker:
                     details["registered_times_valid"] = False
                     return False, f"已报课程 {it.get('name') or it.get('id')} 时间解析失败", details
 
-        # 7. 本地 StateStore 状态完整性检查 (严禁存在未决 UNKNOWN 或 SUBMITTING)
+        # 8. 本地 StateStore 状态完整性检查 (严禁存在未决 UNKNOWN 或 SUBMITTING)
         if state_store is not None:
             unresolved = state_store.get_unresolved_records()
             details["unresolved_count"] = len(unresolved)
@@ -397,9 +469,11 @@ class LocalConflictChecker:
                     return False, "存在未解决 UNKNOWN 记录，安全屏障阻断本地降级评估", details
                 if RegistrationStatus.SUBMITTING in statuses:
                     return False, "存在未完成 SUBMITTING 记录，本地降级阻断", details
+                if RegistrationStatus.VERIFYING in statuses:
+                    return False, "存在正在复核中的记录 (VERIFYING)，本地降级阻断", details
                 return False, f"本地存在未决状态记录 ({','.join(statuses)})，安全阻断", details
 
-        # 全部通过
+        # 全部通过 (空列表且 complete=True 允许评估, C29)
         return True, "本地数据完整可信", details
 
     def check_conflict(
@@ -413,7 +487,9 @@ class LocalConflictChecker:
         extra_slots: Optional[List] = None,
         day_done: Optional[Dict] = None,
         week_done: Optional[Dict] = None,
-        reconciliation_in_progress: bool = False
+        reconciliation_in_progress: bool = False,
+        current_run_id: Optional[str] = None,
+        max_snapshot_age_sec: float = 60.0
     ) -> ConflictCheckResult:
         """
         任务二：本地冲突检查核心逻辑。
@@ -424,7 +500,9 @@ class LocalConflictChecker:
             items=items,
             state_store=state_store,
             tt=tt,
-            reconciliation_in_progress=reconciliation_in_progress
+            reconciliation_in_progress=reconciliation_in_progress,
+            current_run_id=current_run_id,
+            max_snapshot_age_sec=max_snapshot_age_sec
         )
         if not ok:
             return ConflictCheckResult(
@@ -673,7 +751,8 @@ class ConflictManager:
         correlation_id: Optional[str] = None,
         run_id: Optional[str] = None,
         current_week: Optional[int] = None,
-        reconciliation_in_progress: bool = False
+        reconciliation_in_progress: bool = False,
+        max_snapshot_age_sec: float = 60.0
     ) -> Tuple[bool, str]:
         """
         核心对外入口：评估候选活动是否存在冲突。
@@ -701,7 +780,9 @@ class ConflictManager:
                 day_done=day_done,
                 week_done=week_done,
                 current_week=current_week,
-                reconciliation_in_progress=reconciliation_in_progress
+                reconciliation_in_progress=reconciliation_in_progress,
+                current_run_id=r_id,
+                max_snapshot_age_sec=max_snapshot_age_sec
             )
 
         # ---------------- 场景 2: 熔断器检查与服务端调用 ----------------
@@ -729,7 +810,9 @@ class ConflictManager:
                 day_done=day_done,
                 week_done=week_done,
                 current_week=current_week,
-                reconciliation_in_progress=reconciliation_in_progress
+                reconciliation_in_progress=reconciliation_in_progress,
+                current_run_id=r_id,
+                max_snapshot_age_sec=max_snapshot_age_sec
             )
 
         # 允许请求 (NORMAL 或 HALF_OPEN 探测)
@@ -810,9 +893,9 @@ class ConflictManager:
                 request_id=req_id
             )
             if code == 401:
-                return False, "服务端冲突检查返回 401 (Token失效)"
+                return False, "服务端冲突检查返回 401 (Token失效，认证未恢复，禁止报名提交)"
             elif code == 403:
-                return False, "服务端冲突检查返回 403 (权限不足)"
+                return False, "服务端冲突检查返回 403 (权限不足，禁止报名提交)"
             elif code == 400:
                 return False, "服务端冲突检查返回 400 (请求参数错误)"
             else:
@@ -859,7 +942,9 @@ class ConflictManager:
             day_done=day_done,
             week_done=week_done,
             current_week=current_week,
-            reconciliation_in_progress=reconciliation_in_progress
+            reconciliation_in_progress=reconciliation_in_progress,
+            current_run_id=r_id,
+            max_snapshot_age_sec=max_snapshot_age_sec
         )
 
     def _execute_local_fallback(
@@ -874,9 +959,14 @@ class ConflictManager:
         day_done: Optional[Dict],
         week_done: Optional[Dict],
         current_week: Optional[int],
-        reconciliation_in_progress: bool
+        reconciliation_in_progress: bool,
+        current_run_id: Optional[str] = None,
+        max_snapshot_age_sec: float = 60.0
     ) -> Tuple[bool, str]:
         """执行本地降级冲突检查流程"""
+        if current_run_id is None:
+            current_run_id = r_id
+
         self._emit_audit(
             event_name=EventName.LOCAL_CONFLICT_CHECK_STARTED,
             activity_id=aid,
@@ -897,7 +987,9 @@ class ConflictManager:
             extra_slots=extra_slots,
             day_done=day_done,
             week_done=week_done,
-            reconciliation_in_progress=reconciliation_in_progress
+            reconciliation_in_progress=reconciliation_in_progress,
+            current_run_id=current_run_id,
+            max_snapshot_age_sec=max_snapshot_age_sec
         )
 
         # 3.1 本地数据不完整，安全阻断 (BLOCKED)

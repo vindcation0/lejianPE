@@ -203,13 +203,27 @@ class ActivityList(list):
     带有分页完整性元数据与状态码的活动列表。
     继承自内置 list，保证 100% 向后兼容所有以列表方式消费 activity 的调用。
     """
-    def __init__(self, items=None, complete=True, total=0, fetched=0, error=None, http_code=None):
+    def __init__(
+        self,
+        items=None,
+        complete=True,
+        total=0,
+        fetched=0,
+        error=None,
+        http_code=None,
+        fetched_at=None,
+        run_id=None,
+        source="getActivityList"
+    ):
         super().__init__(items or [])
         self.complete = bool(complete)
         self.total = int(total)
         self.fetched = int(fetched)
         self.error = error
         self.http_code = http_code
+        self.fetched_at = fetched_at if fetched_at is not None else time.time()
+        self.run_id = run_id
+        self.source = source
 
     @property
     def items(self):
@@ -223,6 +237,9 @@ class ActivityList(list):
             "fetched": self.fetched,
             "error": self.error,
             "http_code": self.http_code,
+            "fetched_at": self.fetched_at,
+            "run_id": self.run_id,
+            "source": self.source
         }
 
 
@@ -422,7 +439,17 @@ class Client:
             complete = False
             err_msg = f"未拉取全量活动 (已获取 {len(out)}/{total})"
 
-        return ActivityList(out, complete=complete, total=total, fetched=len(out), error=err_msg, http_code=last_http_code)
+        return ActivityList(
+            out,
+            complete=complete,
+            total=total,
+            fetched=len(out),
+            error=err_msg,
+            http_code=last_http_code,
+            fetched_at=time.time(),
+            run_id=getattr(self.audit_logger, "run_id", None) if hasattr(self, "audit_logger") and self.audit_logger else None,
+            source="education/app/activity/getActivityList"
+        )
 
     def check_conflict(self, activity_id):
         code, obj = self.call("GET", "education/app/activity/checkConflict",

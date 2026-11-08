@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from core.audit_logger import AuditLogger, AuditLogReader, EventName, EventType
 from core.circuit_breaker import CircuitBreaker, CircuitState
 from core.conflict_checker import (
+    ActivityList,
     ConflictCheckMode,
     ConflictCheckResult,
     ConflictCircuitBreaker,
@@ -28,17 +29,6 @@ from core.registration_manager import RegistrationManager
 from core.request_manager import RequestManager
 from core.result_reporter import ResultReporter
 from core.state_store import RegistrationStatus, StateStore
-
-
-class ActivityList(list):
-    """带元数据的活动列表模拟对象"""
-    def __init__(self, items=None, complete=True, error=None, total=0, fetched=0, http_code=200):
-        super().__init__(items or [])
-        self.complete = complete
-        self.error = error
-        self.total = total
-        self.fetched = fetched
-        self.http_code = http_code
 
 
 class ConflictFallbackTestSuite(unittest.TestCase):
@@ -618,6 +608,245 @@ class ConflictFallbackTestSuite(unittest.TestCase):
         ok_def, _ = mgr_default.check_activity_conflict(cand, ActivityList([], complete=True))
         self.assertTrue(ok_def)
         self.assertEqual(self.mock_client.call.call_count, 1)
+
+    # =========================================================================
+    # Phase 5 最终封版补充用例 (C27 ~ C38)
+    # =========================================================================
+
+    def test_C27_items_missing_complete_attribute_blocked(self):
+        """C27: items 缺少 complete 属性，必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        # 普通 list 没有 complete 属性
+        plain_items = [{"id": "act_02", "name": "已有课程", "isRegister": True, "startTime": 1731140000000, "endTime": 1731145000000}]
+        ok, msg, details = checker.check_data_integrity(cand, plain_items)
+        self.assertFalse(ok)
+        self.assertFalse(details["has_complete_attr"])
+        self.assertIn("缺失 complete 完整性标记证据", msg)
+
+        # check_conflict 也必须返回 BLOCKED
+        res = checker.check_conflict(cand, plain_items)
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+        # ConflictManager 降级时也阻断
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable)
+        ok_mgr, reason_mgr = mgr.check_activity_conflict(cand, plain_items)
+        self.assertFalse(ok_mgr)
+        self.assertIn("complete", reason_mgr)
+
+    def test_C28_incomplete_pagination_blocked(self):
+        """C28: 分页不完整 (complete=False)，必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        incomplete_items = ActivityList([
+            {"id": "act_02", "name": "已有课程", "isRegister": True, "startTime": 1731140000000, "endTime": 1731145000000}
+        ], complete=False, error="分页未拉取全量")
+
+        ok, msg, details = checker.check_data_integrity(cand, incomplete_items)
+        self.assertFalse(ok)
+        self.assertTrue(details["has_complete_attr"])
+        self.assertFalse(details["items_complete"])
+        self.assertIn("分页不完整", msg)
+
+        res = checker.check_conflict(cand, incomplete_items)
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+    def test_C29_empty_list_with_complete_true_allows_evaluation(self):
+        """C29: 完整且可信的空报名列表允许本地评估"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        # 空列表且 complete=True、带新鲜时间戳
+        empty_items = ActivityList([], complete=True, fetched_at=time.time())
+        ok, msg, details = checker.check_data_integrity(cand, empty_items)
+        self.assertTrue(ok)
+        self.assertTrue(details["has_complete_attr"])
+        self.assertTrue(details["items_complete"])
+
+        # 本地规则评估应正常放行 (无冲突)
+        res = checker.check_conflict(cand, empty_items, tt=self.timetable, cfg={"max_normal": 2})
+        self.assertTrue(res.is_clean)
+        self.assertEqual(res.status, "CLEAN")
+
+        # ConflictManager 降级模式下也正常放行
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable)
+        ok_mgr, reason_mgr = mgr.check_activity_conflict(cand, empty_items)
+        self.assertTrue(ok_mgr)
+        self.assertIn("本地规则检查通过", reason_mgr)
+
+    def test_C30_empty_list_with_complete_false_blocked(self):
+        """C30: 空列表但 complete=False，必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        empty_incomplete = ActivityList([], complete=False, error="拉取失败返回空")
+        ok, msg, details = checker.check_data_integrity(cand, empty_incomplete)
+        self.assertFalse(ok)
+        self.assertIn("complete=False", msg)
+
+        res = checker.check_conflict(cand, empty_incomplete)
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+    def test_C31_expired_local_snapshot_blocked(self):
+        """C31: 本地报名数据超过有效期，必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        # 数据生成时间为 120 秒前，超过 60s 上限
+        expired_items = ActivityList([], complete=True, fetched_at=time.time() - 120.0)
+        ok, msg, details = checker.check_data_integrity(cand, expired_items, max_snapshot_age_sec=60.0)
+        self.assertFalse(ok)
+        self.assertIn("超过有效期", msg)
+
+        res = checker.check_conflict(cand, expired_items, max_snapshot_age_sec=60.0)
+        self.assertTrue(res.is_blocked)
+        self.assertIn("超过有效期", res.reason)
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable)
+        ok_mgr, reason_mgr = mgr.check_activity_conflict(cand, expired_items, max_snapshot_age_sec=60.0)
+        self.assertFalse(ok_mgr)
+        self.assertIn("超过有效期", reason_mgr)
+
+    def test_C32_mismatched_run_id_blocked(self):
+        """C32: 本地数据 run_id 不匹配，必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        old_items = ActivityList([], complete=True, fetched_at=time.time(), run_id="run_old_20261108_01")
+        ok, msg, details = checker.check_data_integrity(cand, old_items, current_run_id="run_new_20261108_02")
+        self.assertFalse(ok)
+        self.assertIn("run_id 不匹配", msg)
+
+        res = checker.check_conflict(cand, old_items, current_run_id="run_new_20261108_02")
+        self.assertTrue(res.is_blocked)
+        self.assertIn("run_id 不匹配", res.reason)
+
+    def test_C33_state_change_after_snapshot_requires_revalidation(self):
+        """C33: 本地数据获取后状态发生变化，必须重新验证"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        checker = LocalConflictChecker()
+
+        # 快照获取时间为 2 秒前
+        t_snapshot = time.time() - 2.0
+        items = ActivityList([], complete=True, fetched_at=t_snapshot)
+
+        # 快照获取之后，本地 StateStore 记录了新的活动状态变更
+        time.sleep(0.01)
+        self.state_store.record_success("act_prev", "篮球", http_status=200)
+
+        ok, msg, details = checker.check_data_integrity(cand, items, state_store=self.state_store)
+        self.assertFalse(ok)
+        self.assertIn("本地数据获取后状态发生变化", msg)
+
+        res = checker.check_conflict(cand, items, state_store=self.state_store)
+        self.assertTrue(res.is_blocked)
+        self.assertEqual(res.status, "BLOCKED")
+
+    def test_C34_401_unauthorized_blocks_submission_without_local_fallback(self):
+        """C34: 401 认证未恢复时，禁止进入报名提交且不计入基础设施熔断"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        self.mock_client.call.return_value = (401, {"code": 401, "msg": "Unauthorized"})
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        items = ActivityList([], complete=True)
+
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok)
+        self.assertIn("401", reason)
+        self.assertIn("认证未恢复", reason)
+
+        # 熔断器绝不进入 OPEN，失败计数不累加
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.NORMAL)
+        self.assertEqual(mgr.breaker.failure_count, 0)
+
+        # 审计日志：没有本地检查启动事件 (禁止盲目本地降级)
+        today_str = datetime.date.today().strftime("%Y%m%d")
+        log_file = os.path.join(self.logs_dir, f"events-{today_str}.jsonl")
+        events = AuditLogReader.read_events_from_file(log_file) if os.path.exists(log_file) else []
+        event_names = [e["event_name"] for e in events]
+        self.assertNotIn(EventName.LOCAL_CONFLICT_CHECK_STARTED, event_names)
+
+    def test_C35_403_forbidden_blocks_submission(self):
+        """C35: 403 权限异常时，禁止报名提交"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        self.mock_client.call.return_value = (403, {"code": 403, "msg": "Forbidden"})
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        items = ActivityList([], complete=True)
+
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok)
+        self.assertIn("403", reason)
+        self.assertIn("权限不足", reason)
+
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.NORMAL)
+        self.assertEqual(mgr.breaker.failure_count, 0)
+
+    def test_C36_400_bad_request_does_not_accumulate_infra_failure(self):
+        """C36: 400 参数异常不累计基础设施熔断次数"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+        self.mock_client.call.return_value = (400, {"code": 400, "msg": "Bad Request"})
+
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": True}, tt=self.timetable, audit_logger=self.audit_logger)
+        items = ActivityList([], complete=True)
+
+        # 连续触发 5 次 400
+        for _ in range(5):
+            ok, reason = mgr.check_activity_conflict(cand, items)
+            self.assertFalse(ok)
+            self.assertIn("400", reason)
+
+        # 熔断器依然为 NORMAL，基础设施失败计数严格为 0
+        self.assertEqual(mgr.breaker.failure_count, 0)
+        self.assertEqual(mgr.breaker.state, ConflictCircuitState.NORMAL)
+
+    def test_C37_only_retryable_allows_local_evaluation(self):
+        """C37: 只有 RETRYABLE 时，完成重新校验后允许进入本地评估"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+
+        # 写入一条 RETRYABLE 记录 (已被确认未报名，可重试)
+        self.state_store.record_submitting("act_reconciled", "排球")
+        self.state_store.record_retryable("act_reconciled", reason="全局对账确认未报名")
+
+        # 对账后拉取最新报名列表
+        time.sleep(0.01)
+        items = ActivityList([], complete=True, fetched_at=time.time())
+
+        # 状态检查：未决列表中不包含 RETRYABLE
+        unresolved = self.state_store.get_unresolved_records()
+        self.assertEqual(len(unresolved), 0)
+
+        # 本地冲突评估放行
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable, state_store=self.state_store)
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertTrue(ok)
+        self.assertIn("本地规则检查通过", reason)
+
+    def test_C38_unknown_with_retryable_still_blocked(self):
+        """C38: 存在 UNKNOWN 时，即使同时存在 RETRYABLE，也必须 BLOCKED"""
+        cand = {"id": "act_01", "name": "羽毛球", "startTime": 1731132000000, "endTime": 1731137700000}
+
+        # 一条 RETRYABLE
+        self.state_store.record_submitting("act_reconciled", "排球")
+        self.state_store.record_retryable("act_reconciled", reason="全局对账确认未报名")
+
+        # 另一条未决 UNKNOWN
+        self.state_store.record_submitting("act_unknown", "足球")
+        self.state_store.record_unknown("act_unknown", "足球", error="网络超时未决")
+
+        items = ActivityList([], complete=True, fetched_at=time.time())
+
+        # 本地冲突评估必须安全阻断
+        mgr = ConflictManager(self.mock_client, cfg={"check_conflict": False}, tt=self.timetable, state_store=self.state_store)
+        ok, reason = mgr.check_activity_conflict(cand, items)
+        self.assertFalse(ok)
+        self.assertIn("UNKNOWN", reason)
+        self.assertIn("安全屏障阻断", reason)
 
 
 if __name__ == "__main__":
