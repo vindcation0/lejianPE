@@ -88,11 +88,13 @@ class RegistrationManager:
             if not ok:
                 return False, RegistrationStatus.FAILED, f"规则校验未通过: {reason}", item
 
-        # ---------------- 3. 提交前持久化 SUBMITTING ----------------
+        # ---------------- 3. 提交前持久化 SUBMITTING (原子预留防 TOCTOU) ----------------
         t_start = datetime.datetime.now()
         attempts = 1
         try:
-            cur_rec = self.state_store.record_submitting(aid, name)
+            ok_res, cur_rec, res_err = self.state_store.reserve_submitting(aid, name)
+            if not ok_res:
+                return False, RegistrationStatus.UNKNOWN, f"安全屏障互斥生效，禁止并发提交: {res_err}", item
             if cur_rec:
                 attempts = cur_rec.get("attempts", 1)
         except StateStoreError as e:

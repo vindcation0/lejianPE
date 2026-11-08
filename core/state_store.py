@@ -7,7 +7,7 @@ SQLite 状态持久化模块 (StateStore)
 import datetime
 import os
 import sqlite3
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class RegistrationStatus:
@@ -132,6 +132,45 @@ class StateStore:
     def get_unresolved_activity_ids(self) -> List[str]:
         """获取所有处于未决状态的 activity_id 列表"""
         return [r["activity_id"] for r in self.get_unresolved_records()]
+
+    def reserve_submitting(self, activity_id: str, activity_name: str) -> Tuple[bool, Optional[Dict], str]:
+        """
+        原子预留并进入 SUBMITTING 状态：
+        使用 BEGIN IMMEDIATE 事务立即获得独占写锁，在单次原子事务中完成：
+        1. 检查是否存在其他活动的未决记录 (SUBMITTING, UNKNOWN, VERIFYING)；
+        2. 若存在其他未决记录，立即回滚并返回 False，阻断多进程并发预留；
+        3. 若不存在，原子写入当前活动的 SUBMITTING 记录并提交事务。
+
+        返回: (success: bool, record: Optional[Dict], message: str)
+        """
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                # 1. 检查是否存在其他未决记录
+                cur = conn.execute(
+                    "SELECT * FROM registration_records WHERE status IN (?, ?, ?) AND activity_id != ? LIMIT 1",
+                    (RegistrationStatus.SUBMITTING, RegistrationStatus.UNKNOWN, RegistrationStatus.VERIFYING, str(activity_id))
+                )
+                other_row = cur.fetchone()
+                if other_row:
+                    conn.execute("ROLLBACK;")
+                    other_rec = dict(other_row)
+                    return False, other_rec, f"已存在未决活动 {other_rec.get('activity_name')} (id={other_rec.get('activity_id')}, 状态={other_rec.get('status')})，全局互斥锁定"
+
+                # 2. 写入/更新当前记录（调用 self.record_submitting 保证兼容单测与主逻辑一致性）
+                cur_rec = self.record_submitting(activity_id, activity_name)
+                return True, cur_rec, "OK"
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                raise
+        except StateStoreError:
+            raise
+        except Exception as e:
+            raise StateStoreError(f"原子预留 SUBMITTING 失败 {activity_id}: {e}") from e
 
     def record_submitting(self, activity_id: str, activity_name: str) -> Dict:
         """

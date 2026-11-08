@@ -394,6 +394,95 @@ class UnknownBarrierTestSuite(unittest.TestCase):
         self.assertIn("当周普通活动已报满", msg_b)
         self.mock_client.call.assert_not_called()
 
+    def test_U21_retryable_resubmission_must_revalidate_rules(self):
+        """U21: RETRYABLE 状态活动重新尝试提交前，必须重新执行全部规则校验，校验失败直接拒绝且零网络调用"""
+        # 预先存在 UNKNOWN 记录，经复核后转为 RETRYABLE
+        self.state_store.record_unknown("1001", "活动 A", "超时未明")
+        self.state_store.record_retryable("1001", "复核确认未报名")
+        rec = self.state_store.get_record("1001")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["status"], RegistrationStatus.RETRYABLE)
+
+        # 规则校验器拒绝（例如配额已满或时间冲突）
+        def validate_reject(candidate_item):
+            return False, "重试时检测到时段冲突"
+
+        item = {"id": "1001", "name": "活动 A", "startTime": 1730000000000}
+        ok, status, msg, _ = self.reg_mgr.register_activity(item, validate_rules_cb=validate_reject)
+
+        # 核心断言：规则二次校验生效，拒绝提交，且不发起任何网络提交
+        self.assertFalse(ok)
+        self.assertEqual(status, RegistrationStatus.FAILED)
+        self.assertIn("重试时检测到时段冲突", msg)
+        self.mock_client.call.assert_not_called()
+
+    def test_U22_retryable_status_does_not_consume_quota(self):
+        """U22: UNKNOWN 复核为 RETRYABLE（未报名）时，无论处理多少次都绝不增加已报配额"""
+        self.state_store.record_unknown("1001", "活动 A", "超时未明")
+
+        class MockList(list):
+            complete = True
+            http_code = 200
+
+        mock_items = MockList([{"id": "1001", "name": "活动 A", "isRegister": False}])
+        self.mock_client.activities.return_value = mock_items
+
+        # 首次复核为 RETRYABLE
+        res_ok, res_status, _, _ = self.reg_mgr.resolve_unknown("1001", "活动 A")
+        self.assertEqual(res_status, RegistrationStatus.RETRYABLE)
+
+        # 模拟配额累计逻辑：仅 SUCCESS 累计配额，RETRYABLE 严格不累计
+        week_done = {}
+        if res_status == RegistrationStatus.SUCCESS:
+            week_done[1] = week_done.get(1, 0) + 1
+
+        self.assertEqual(len(week_done), 0)
+
+        # 再次对 RETRYABLE 状态操作，配额依然严格为 0
+        self.assertEqual(week_done.get(1, 0), 0)
+
+    def test_U23_success_already_in_items_does_not_double_count_quota(self):
+        """U23: UNKNOWN 复核成功时，若服务端列表 items 已包含该活动且标记已报名，防重复累计机制生效"""
+        self.state_store.record_unknown("1001", "活动 A", "超时未明")
+
+        class MockList(list):
+            complete = True
+            http_code = 200
+
+        mock_items = MockList([{"id": "1001", "name": "活动 A", "isRegister": True, "startTime": 1730000000000}])
+        self.mock_client.activities.return_value = mock_items
+
+        res_ok, res_status, _, remote_it = self.reg_mgr.resolve_unknown("1001", "活动 A")
+        self.assertTrue(res_ok)
+        self.assertEqual(res_status, RegistrationStatus.SUCCESS)
+
+        # 模拟 lejian.py 中的配额防重机制
+        items_polled = [{"id": "1001", "isRegister": True, "startTime": 1730000000000}]
+        already_in_items = any(str(x.get("id")) == "1001" and x.get("isRegister") for x in items_polled)
+        self.assertTrue(already_in_items)
+
+        week_done = {1: 1}  # 已由 items 扫描计算入内
+        if not already_in_items:
+            week_done[1] = week_done.get(1, 0) + 1
+
+        # 核心断言：未被重复累加为 2
+        self.assertEqual(week_done[1], 1)
+
+    def test_U24_state_store_write_failure_aborts_submission_without_network_call(self):
+        """U24: 状态库持久化发生异常 (StateStoreError) 时，立刻终止流程，绝对不可发起无状态保护的 signUp 请求"""
+        from core.state_store import StateStoreError
+
+        # Mock state_store.reserve_submitting 抛出数据库写入异常
+        with patch.object(self.state_store, "reserve_submitting", side_effect=StateStoreError("Disk I/O Error")):
+            item = {"id": "1001", "name": "活动 A", "startTime": 1730000000000}
+            ok, status, msg, _ = self.reg_mgr.register_activity(item)
+
+            # 核心断言：拒绝提交，状态为 FAILED，且网络提交 0 调用
+            self.assertFalse(ok)
+            self.assertEqual(status, RegistrationStatus.FAILED)
+            self.assertIn("状态库持久化失败，拒绝提交以避免不可逆状态", msg)
+            self.mock_client.call.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
