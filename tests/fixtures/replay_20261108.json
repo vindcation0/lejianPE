@@ -1,0 +1,265 @@
+{
+  "provenance": {
+    "event_source": "logs/events-20261108.jsonl (timestamp, event, code, outage and pseudonymized activity only)",
+    "request_source": "logs/requests-20261108.jsonl (same pseudonyms, timestamps and outcome fields)",
+    "registered_items_source": "logs/reports/2026-11-08-report.md, 已确认落地活动清单 (historical report evidence, not a raw server response)",
+    "event_window": [
+      "2026-11-08T13:58:00",
+      "2026-11-08T14:12:00"
+    ],
+    "second_instance_started_at": "2026-11-08T14:10:35.894",
+    "second_instance_start_source": "logs/run-20261108.log, startup reconciliation entry"
+  },
+  "events": [
+    {
+      "t": "2026-11-08T13:58:58",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:02:51",
+      "event": "list_fail",
+      "http": 502
+    },
+    {
+      "t": "2026-11-08T14:02:58",
+      "event": "list_fail",
+      "http": 503
+    },
+    {
+      "t": "2026-11-08T14:03:48",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:03:56",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:04:31",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:05:04",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:05:37",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:05:51",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:06:58",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:07:18",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:07:23",
+      "event": "list_ok",
+      "outage_sec": 5
+    },
+    {
+      "t": "2026-11-08T14:08:03",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:08:04",
+      "event": "list_ok",
+      "outage_sec": 1
+    },
+    {
+      "t": "2026-11-08T14:08:22",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:08:30",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:08:50",
+      "event": "list_ok",
+      "outage_sec": 21
+    },
+    {
+      "t": "2026-11-08T14:08:57",
+      "event": "resolve_unknown_not_registered",
+      "aid": "activity_1"
+    },
+    {
+      "t": "2026-11-08T14:09:46",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:10:05",
+      "event": "list_ok",
+      "outage_sec": 19
+    },
+    {
+      "t": "2026-11-08T14:11:06",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:11:07",
+      "event": "list_ok",
+      "outage_sec": 1
+    },
+    {
+      "t": "2026-11-08T14:11:07",
+      "event": "resolve_unknown_not_registered",
+      "aid": "activity_2"
+    },
+    {
+      "t": "2026-11-08T14:11:09",
+      "event": "list_fail",
+      "http": 500
+    },
+    {
+      "t": "2026-11-08T14:11:10",
+      "event": "list_ok",
+      "outage_sec": 1
+    },
+    {
+      "t": "2026-11-08T14:11:23",
+      "event": "list_fail",
+      "http": -1
+    },
+    {
+      "t": "2026-11-08T14:11:23",
+      "event": "resolve_unknown_failed",
+      "aid": "activity_2"
+    },
+    {
+      "t": "2026-11-08T14:11:24",
+      "event": "list_ok",
+      "outage_sec": 1
+    },
+    {
+      "t": "2026-11-08T14:11:38",
+      "event": "resolve_unknown_not_registered",
+      "aid": "activity_2"
+    }
+  ],
+  "requests": [
+    {
+      "action": "sign_up_and_verify",
+      "started_at": "2026-11-08T14:08:09.054",
+      "finished_at": "2026-11-08T14:08:22.471",
+      "http_status": -1,
+      "final_state": "UNKNOWN",
+      "business_success": null,
+      "registration_verified": false,
+      "activity_id": "activity_1",
+      "activity_name": "activity_1"
+    },
+    {
+      "action": "sign_up_and_verify",
+      "started_at": "2026-11-08T14:10:11.528",
+      "finished_at": "2026-11-08T14:10:31.045",
+      "http_status": -1,
+      "final_state": "RETRYABLE",
+      "business_success": false,
+      "registration_verified": true,
+      "activity_id": "activity_1",
+      "activity_name": "activity_1"
+    },
+    {
+      "action": "sign_up_and_verify",
+      "started_at": "2026-11-08T14:10:47.064",
+      "finished_at": "2026-11-08T14:11:06.496",
+      "http_status": -1,
+      "final_state": "UNKNOWN",
+      "business_success": null,
+      "registration_verified": false,
+      "activity_id": "activity_2",
+      "activity_name": "activity_2"
+    },
+    {
+      "action": "sign_up_and_verify",
+      "started_at": "2026-11-08T14:11:07.700",
+      "finished_at": "2026-11-08T14:11:09.227",
+      "http_status": 500,
+      "final_state": "UNKNOWN",
+      "business_success": null,
+      "registration_verified": false,
+      "activity_id": "activity_2",
+      "activity_name": "activity_2"
+    },
+    {
+      "action": "sign_up",
+      "started_at": "2026-11-08T14:11:38.151",
+      "finished_at": "2026-11-08T14:11:38.340",
+      "http_status": 200,
+      "final_state": "FAILED",
+      "business_success": false,
+      "registration_verified": null,
+      "activity_id": "activity_2",
+      "activity_name": "activity_2"
+    },
+    {
+      "action": "sign_up",
+      "started_at": "2026-11-08T14:11:38.342",
+      "finished_at": "2026-11-08T14:11:38.574",
+      "http_status": 200,
+      "final_state": "SUCCESS",
+      "business_success": true,
+      "registration_verified": true,
+      "activity_id": "activity_1",
+      "activity_name": "activity_1"
+    },
+    {
+      "action": "sign_up_and_verify",
+      "started_at": "2026-11-08T14:11:38.576",
+      "finished_at": "2026-11-08T14:11:45.058",
+      "http_status": -1,
+      "final_state": "RETRYABLE",
+      "business_success": false,
+      "registration_verified": true,
+      "activity_id": "activity_3",
+      "activity_name": "activity_3"
+    },
+    {
+      "action": "sign_up",
+      "started_at": "2026-11-08T14:11:45.060",
+      "finished_at": "2026-11-08T14:11:45.295",
+      "http_status": 200,
+      "final_state": "SUCCESS",
+      "business_success": true,
+      "registration_verified": true,
+      "activity_id": "activity_4",
+      "activity_name": "activity_4"
+    }
+  ],
+  "registered_items": [
+    {
+      "id": "activity_1",
+      "name": "activity_1",
+      "isRegister": true,
+      "startTime": 1794479700000
+    },
+    {
+      "id": "activity_4",
+      "name": "activity_4",
+      "isRegister": true,
+      "startTime": 1794306900000
+    }
+  ],
+  "unresolved_count_at_reconciliation": 0
+}
