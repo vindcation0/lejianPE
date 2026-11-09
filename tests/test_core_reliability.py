@@ -200,17 +200,17 @@ class CoreReliabilityTestSuite(unittest.TestCase):
         results = [None] * 5
 
         def worker(idx):
-            with patch("lejian._request", side_effect=mock_request_fn), \
-                 patch("lejian.save_json"):
-                results[idx] = client.ensure_token(margin=1200)
+            results[idx] = client.ensure_token(margin=1200)
 
-        for i in range(5):
-            t = threading.Thread(target=worker, args=(i,))
-            threads.append(t)
-            t.start()
+        # 模块级替身覆盖整个并发区间，避免各线程乱序恢复同一个函数。
+        with patch("lejian._request", side_effect=mock_request_fn), patch("lejian.save_json"):
+            for i in range(5):
+                t = threading.Thread(target=worker, args=(i,))
+                threads.append(t)
+                t.start()
 
-        for t in threads:
-            t.join()
+            for t in threads:
+                t.join()
 
         # 验证所有线程获得的新 Token 一致
         for res in results:

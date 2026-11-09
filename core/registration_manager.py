@@ -6,6 +6,7 @@
 杜绝因网络抖动和网关 5xx 造成的重复报名。
 """
 import datetime
+import uuid
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from .audit_logger import AuditLogger
@@ -44,7 +45,7 @@ class RegistrationManager:
         """
         aid = str(item.get("id"))
         name = (item.get("name") or "").replace("\n", " ").strip()
-        correlation_id = f"corr_{aid}_{int(datetime.datetime.now().timestamp()*1000)}"
+        correlation_id = uuid.uuid4().hex
 
         # ---------------- 0. UNKNOWN 安全屏障：全局单未决请求互斥 (U12) ----------------
         try:
@@ -311,6 +312,7 @@ class RegistrationManager:
             rec = self.state_store.get_record(aid)
             name = rec.get("activity_name", "") if rec else ""
 
+        correlation_id = correlation_id or uuid.uuid4().hex
         self.state_store.record_verifying(aid)
         if hasattr(self.audit_logger, "record_event"):
             self.audit_logger.record_event(
@@ -318,7 +320,8 @@ class RegistrationManager:
                 event_name="verification_started",
                 activity_id=aid,
                 source="registration_manager",
-                correlation_id=correlation_id
+                correlation_id=correlation_id,
+                details={"name": name}
             )
 
         verified, is_reg, remote_item = self.req_mgr.verify_registration(aid, correlation_id=correlation_id)
@@ -334,7 +337,6 @@ class RegistrationManager:
                         source="registration_manager",
                         correlation_id=correlation_id
                     )
-                self.audit_logger.log_event("resolve_unknown_success", {"aid": aid, "name": name})
                 return True, RegistrationStatus.SUCCESS, f"复核确认已成功: {name}", remote_item
             else:
                 self.state_store.record_retryable(aid, "复核明确确认未报名")
@@ -347,7 +349,6 @@ class RegistrationManager:
                         source="registration_manager",
                         correlation_id=correlation_id
                     )
-                self.audit_logger.log_event("resolve_unknown_not_registered", {"aid": aid, "name": name})
                 return False, RegistrationStatus.RETRYABLE, f"复核明确确认未报名: {name}", remote_item
         else:
             self.state_store.record_unknown(aid, name, "复核失败或列表不完整，保持 UNKNOWN")
@@ -360,5 +361,4 @@ class RegistrationManager:
                     source="registration_manager",
                     correlation_id=correlation_id
                 )
-            self.audit_logger.log_event("resolve_unknown_failed", {"aid": aid, "name": name})
             return False, RegistrationStatus.UNKNOWN, f"复核失败或列表不完整，保持 UNKNOWN: {name}", None

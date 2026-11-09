@@ -63,6 +63,7 @@ class ResultReporter:
         self.explicit_failed = 0
         self.unknown_count = 0
         self.attempt_records: List[Dict] = []
+        self._recorded_attempt_ids = set()
 
         # ---------------- C. UNKNOWN 复核 (Verification) ----------------
         self.verification_count = 0
@@ -99,6 +100,7 @@ class ResultReporter:
         self.weekly_limit_exceeded = False
 
         # ---------------- F. 网络与故障统计 (Infrastructure) ----------------
+        self.activities_metrics_scoped = True
         self.http_requests_total = 0
         self.http_requests_succeeded = 0
         self.http_requests_failed = 0
@@ -182,12 +184,14 @@ class ResultReporter:
         self.verification_avg_duration_ms = float(summary.get("verification_avg_duration_ms", 0.0))
 
         # 底层 HTTP 请求统计
-        self.http_requests_total = summary.get("http_requests_total", 0)
-        self.http_requests_succeeded = summary.get("http_requests_succeeded", 0)
-        self.http_requests_failed = summary.get("http_requests_failed", 0)
-        breakdown = summary.get("http_failures_by_code") or {}
+        self.activities_metrics_scoped = summary.get("activities_metrics_scoped", False)
+        prefix = "activities" if self.activities_metrics_scoped else "http"
+        self.http_requests_total = summary.get(f"{prefix}_requests_total", 0)
+        self.http_requests_succeeded = summary.get(f"{prefix}_requests_succeeded", 0)
+        self.http_requests_failed = summary.get(f"{prefix}_requests_failed", 0)
+        breakdown = summary.get(f"{prefix}_failures_by_code") or {}
         self.http_failure_counts = collections.Counter({int(k): v for k, v in breakdown.items()})
-        self.http_avg_duration_ms = float(summary.get("http_avg_duration_ms", 0.0))
+        self.http_avg_duration_ms = float(summary.get(f"{prefix}_avg_duration_ms", 0.0))
         self.timeout_count = self.http_failure_counts.get(-1, 0)
         self.network_error_count = sum(cnt for code, cnt in self.http_failure_counts.items() if code < 0 or code >= 500)
 
@@ -214,19 +218,10 @@ class ResultReporter:
         self.local_conflict_check_blocked_count = summary.get("local_conflict_check_blocked_count", 0)
         self.conflict_service_recovered_count = summary.get("conflict_service_recovered_count", 0)
         conf_breakdown = summary.get("conflict_failures_by_code") or {}
-        if conf_breakdown:
-            self.conflict_failure_counts.update({int(k): v for k, v in conf_breakdown.items()})
+        self.conflict_failure_counts = collections.Counter({int(k): v for k, v in conf_breakdown.items()})
 
-        # 提交明细清洗：严格保证 attempt_records 仅包含真实 Submission 尝试
-        if self.attempt_records:
-            cleaned_attempts = []
-            for r in self.attempt_records:
-                reas = str(r.get("reason", ""))
-                if reas.startswith("复核确认") or reas.startswith("复核明确"):
-                    self.verification_records.append(r)
-                else:
-                    cleaned_attempts.append(r)
-            self.attempt_records = cleaned_attempts
+        self.attempt_records = list(summary.get("submission_records") or [])
+        self.verification_records = list(summary.get("verification_records") or [])
 
     def record_conflict_failure(self, http_code: int):
         """独立记录 checkConflict 的 HTTP 失败，绝不混入 activities 列表失败统计 (C23)"""
@@ -352,9 +347,9 @@ class ResultReporter:
         """
         st = status.upper()
         self.verification_count += 1
-        if st == "SUCCESS" or "已报名" in reason:
+        if st == "SUCCESS":
             self.verification_confirmed_registered += 1
-        elif st == "RETRYABLE" or "未报名" in reason:
+        elif st == "RETRYABLE" or (st == "FAILED" and "未报名" in reason):
             self.verification_confirmed_unregistered += 1
         else:
             self.verification_remains_unknown += 1
@@ -378,7 +373,11 @@ class ResultReporter:
         event_id: Optional[str] = None
     ):
         """记录一次真实报名提交尝试（仅在实际发起 signUp 提交时调用）"""
-        # 防御性分流：如果误将纯复核操作调用至 record_attempt，自动分流至 record_verification
+        if event_id:
+            if event_id in self._recorded_attempt_ids:
+                return
+            self._recorded_attempt_ids.add(event_id)
+        # 兼容旧调用，正式报告的明细由审计事件回放生成。
         if reason.startswith("复核确认") or reason.startswith("复核明确"):
             self.record_verification(activity_id, activity_name, status, reason, request_id=request_id)
             return
@@ -409,13 +408,11 @@ class ResultReporter:
 
     def set_circuit_metrics(self, outage_seconds: float, trip_count: int):
         """设置熔断器指标（兼容旧接口与单测）"""
-        # 权威性原则：审计日志是事实来源。若已由 AuditLogReader.replay 设置了 audit_summary，
-        # 且已存在非零事实指标，展示层绝不能被内存熔断器的零值覆盖！
-        if self.audit_bound and self.audit_summary is not None:
-            if self.outage_seconds > 0 or self.breaker_trips > 0:
-                return
-        self.outage_seconds = round(float(outage_seconds), 2)
-        self.breaker_trips = int(trip_count)
+        summary = self.audit_summary or {}
+        if summary.get("outage_seconds") is None:
+            self.outage_seconds = round(float(outage_seconds), 2)
+        if summary.get("circuit_trips") is None:
+            self.breaker_trips = int(trip_count)
 
     # =========================================================================
     # 核心结论状态机与综合汇总
@@ -626,6 +623,7 @@ class ResultReporter:
                 "breaker_trips": self.breaker_trips
             },
             "infrastructure": {
+                "activities_metrics_scoped": self.activities_metrics_scoped,
                 "http_total": self.http_requests_total,
                 "http_succeeded": self.http_requests_succeeded,
                 "http_failed": self.http_requests_failed,
@@ -762,7 +760,10 @@ class ResultReporter:
         inf = sm["infrastructure"]
         conf = sm.get("conflict_check") or {}
         lines.append("六、HTTP 请求与基础设施状态")
-        lines.append("  [活动列表 activities]")
+        if inf["activities_metrics_scoped"]:
+            lines.append("  [活动列表 activities]")
+        else:
+            lines.append("  [底层 HTTP，历史事件未标明接口]")
         lines.append(f"  HTTP 请求总数    ：{inf['http_total']} 次")
         lines.append(f"  HTTP 成功次数    ：{inf['http_succeeded']} 次")
         lines.append(f"  HTTP 失败总计    ：{inf['http_failed']} 次")
@@ -956,7 +957,10 @@ class ResultReporter:
 
         # 七、服务器故障与熔断统计
         lines.append("## 七、服务器故障与熔断统计")
-        lines.append("### 7.1 活动列表 (activities) 状态")
+        if inf["activities_metrics_scoped"]:
+            lines.append("### 7.1 活动列表 (activities) 状态")
+        else:
+            lines.append("### 7.1 底层 HTTP 状态（历史事件未标明接口）")
         lines.append(f"- **HTTP 请求总数**：{inf['http_total']} 次")
         lines.append(f"- **HTTP 成功总数**：{inf['http_succeeded']} 次")
         lines.append(f"- **请求异常总数**：{inf['http_failed']} 次")

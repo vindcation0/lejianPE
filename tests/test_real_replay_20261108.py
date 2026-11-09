@@ -5,56 +5,32 @@ Phase 8: 2026-11-08 真实事件回放与审计报告数据闭环测试套件
 1. 连续活动列表失败与多种 HTTP 状态码 (-1: 8次, 500: 8次, 502: 1次, 503: 1次，合计 18 次)。
 2. 多次服务恢复与累计中断时长 (7 次恢复，累计 49.0 秒)。
 3. UNKNOWN 产生、复核未报名与复核成功分支。
-4. 真实提交调用 (6 次) 与 UNKNOWN 只读复核 (2 次) 严格物理分离，杜绝虚增至 8 次。
-5. 最终服务端全局对账 (2 节落地：王彤帆、周天一，无未决记录)。
+4. 第二实例 6 次提交与 3 次屏障复核分离（2 次确认未报名，1 次未确认）。
+5. 从历史报告脱敏提取的 2 条报名记录，经 Mock 列表重新对账。
 6. 原始事件去重幂等性 (Seen Event IDs)。
 7. 审计事实单向优先性 (set_circuit_metrics 绝不覆盖 AuditLogReader 的真实统计)。
 8. checkConflict 失败与 activities 列表失败独立统计。
 """
-import collections
 import datetime
 import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 from core.audit_logger import AuditLogger, AuditLogReader, EventName, EventType
 from core.circuit_breaker import CircuitBreaker
 from core.result_reporter import ReportStatus, ResultReporter
-from core.state_store import RegistrationStatus, StateStore
+from core.reconciliation import ReconciliationManager
+from core.registration_manager import RegistrationManager
+from core.request_manager import RequestManager
+from core.state_store import StateStore
+from lejian import ActivityList, Client
 
-# 2026-11-08 抢课实战脱敏事件序列 (13:58:58 ~ 14:11:38)
-RAW_EVENTS_20261108 = [
-    {"t": "2026-11-08T13:58:58", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:02:51", "event": "list_fail", "http": 502},
-    {"t": "2026-11-08T14:02:58", "event": "list_fail", "http": 503},
-    {"t": "2026-11-08T14:03:48", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:03:56", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:04:31", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:05:04", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:05:37", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:05:51", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:06:58", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:07:18", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:07:23", "event": "list_ok", "outage_sec": 5},
-    {"t": "2026-11-08T14:08:03", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:08:04", "event": "list_ok", "outage_sec": 1},
-    {"t": "2026-11-08T14:08:22", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:08:30", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:08:50", "event": "list_ok", "outage_sec": 21},
-    {"t": "2026-11-08T14:08:57", "event": "resolve_unknown_not_registered", "aid": "act_wang", "name": "户外跑 王彤帆"},
-    {"t": "2026-11-08T14:09:46", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:10:05", "event": "list_ok", "outage_sec": 19},
-    {"t": "2026-11-08T14:11:06", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:11:07", "event": "list_ok", "outage_sec": 1},
-    {"t": "2026-11-08T14:11:07", "event": "resolve_unknown_not_registered", "aid": "act_cheng", "name": "户外跑 程启航"},
-    {"t": "2026-11-08T14:11:09", "event": "list_fail", "http": 500},
-    {"t": "2026-11-08T14:11:10", "event": "list_ok", "outage_sec": 1},
-    {"t": "2026-11-08T14:11:23", "event": "list_fail", "http": -1},
-    {"t": "2026-11-08T14:11:23", "event": "resolve_unknown_failed", "aid": "act_cheng", "name": "户外跑 程启航"},
-    {"t": "2026-11-08T14:11:24", "event": "list_ok", "outage_sec": 1},
-    {"t": "2026-11-08T14:11:38", "event": "resolve_unknown_not_registered", "aid": "act_cheng", "name": "户外跑 程启航"},
-]
+# 只读取版本库中的脱敏样本，不依赖本机生产日志或配置。
+FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "replay_20261108.json").read_text(encoding="utf-8"))
+RAW_EVENTS_20261108 = FIXTURE["events"]
 
 
 class TestRealReplay20261108(unittest.TestCase):
@@ -119,7 +95,7 @@ class TestRealReplay20261108(unittest.TestCase):
 
     # ---------------- 3. 提交与复核严格分离验证 ----------------
     def test_03_submission_and_verification_separation_real_data(self):
-        """验证 11 月 8 日第二实例中 6 次真实提交与 2 次复核完全解耦，提交总数不再虚增为 8"""
+        """兼容接口将旧调用中误记为提交的复核分流到独立明细。"""
         reporter = ResultReporter(run_date=datetime.date(2026, 11, 8), run_id="run_20261108_inst2")
 
         # 模拟 11 月 8 日第二实例实际发生的 6 次真实 signUp 提交
@@ -175,78 +151,63 @@ class TestRealReplay20261108(unittest.TestCase):
 
     # ---------------- 5. 11月8日真实基准端到端报告生成验收 ----------------
     def test_05_end_to_end_report_matches_20261108_ground_truth(self):
-        """端到端验证 2026-11-08 抢课报告：18次失败、49.0s中断、6次提交、2节成功落地、对账通过"""
-        reporter = ResultReporter(run_date=datetime.date(2026, 11, 8), run_id="run_20261108_final")
-
-        # 1. 注入真实 6 次提交明细（模拟抢课运行时各次提交）
-        reporter.record_attempt("act_cheng", "户外跑 程启航", "UNKNOWN", "提交异常且无法复核状态(请求超时)")
-        reporter.record_attempt("act_cheng", "户外跑 程启航", "UNKNOWN", "提交异常且无法复核状态(HTTP 500)")
-        reporter.record_attempt("act_cheng", "户外跑 程启航", "FAILED", "报名人数已经满")
-        reporter.record_attempt("act_wang", "户外跑 王彤帆", "SUCCESS", "报名成功")
-        reporter.record_attempt("act_liao", "户外跑 廖华", "RETRYABLE", "提交异常(请求超时)，复核确认未报名")
-        reporter.record_attempt("act_zhou", "户外跑 周天一", "SUCCESS", "报名成功")
-
-        # 2. 注入真实 2 次复核明细
-        reporter.record_verification("act_cheng", "户外跑 程启航", "RETRYABLE", "复核确认未报名")
-        reporter.record_verification("act_cheng", "户外跑 程启航", "RETRYABLE", "复核确认未报名")
-
-        # 3. 注入审计回放数据（模拟抢课循环结束时 replay 汇总并 set_audit_summary）
+        """从历史事件、提交记录和脱敏对账证据生成报告，不注入计数。"""
+        second_start = FIXTURE["provenance"]["second_instance_started_at"]
+        start, end = FIXTURE["provenance"]["event_window"]
         events = AuditLogReader.read_events_from_file(self.event_file)
-        audit_summary = AuditLogReader.replay(events, start_time="2026-11-08T13:58:00", end_time="2026-11-08T14:12:00")
-        audit_summary["submission_started_count"] = 6
-        audit_summary["submission_succeeded_count"] = 2
-        audit_summary["submission_failed_count"] = 2
-        audit_summary["submission_unknown_count"] = 2
-        audit_summary["verification_started_count"] = 2
-        audit_summary["verification_confirmed_unregistered_count"] = 2
-        reporter.set_audit_summary(audit_summary)
-
-        # 4. 服务端最终对账（落地 2 节：王彤帆、周天一，无未决）
-        reconcile_report = {
-            "success": True,
-            "status": "SUCCESS",
-            "run_id": "run_20261108_final",
-            "complete": True,
-            "total_registered": 2,
-            "normal_registered": 2,
-            "items": [
-                {"id": "act_wang", "name": "户外跑 王彤帆", "isRegister": True, "startTime": 1731407700000},
-                {"id": "act_zhou", "name": "户外跑 周天一", "isRegister": True, "startTime": 1731234900000}
-            ]
-        }
-        reporter.set_reconciliation_result(
-            reconciled_items=reconcile_report["items"],
-            unresolved_count=0,
-            normal_registered=2,
-            max_normal=2,
-            reconciliation_report=reconcile_report
+        # 基础设施统计使用完整窗口，复核与提交只取第二实例。
+        report_events = [
+            event for event in events if event["event_type"] == EventType.INFRASTRUCTURE
+            or event["timestamp"] >= second_start
+        ]
+        request_file = Path(self.logs_dir) / "requests-20261108.jsonl"
+        request_file.write_text(
+            "".join(json.dumps(row) + "\n" for row in FIXTURE["requests"]), encoding="utf-8"
+        )
+        report_events.extend(
+            event for event in AuditLogReader.read_events_from_file(str(request_file))
+            if event["timestamp"] >= second_start
         )
 
-        # 5. 生成报告并断言
+        logger = AuditLogger(self.logs_dir, run_id="run_20261108_fixture")
+        reporter = ResultReporter(run_date=datetime.date(2026, 11, 8), run_id=logger.run_id)
+        reporter.set_audit_summary(AuditLogReader.replay(
+            report_events, run_id="legacy_run", start_time=start, end_time=end, log_dir=self.logs_dir
+        ))
+
+        # 用历史报告中的确认清单模拟只读列表响应。没有历史原始服务端响应。
+        client = Mock()
+        client.activities.return_value = ActivityList(FIXTURE["registered_items"], complete=True)
+        result = ReconciliationManager(
+            client, {"max_normal": 2, "max_per_day": 1}, {},
+            lambda date, _: date.isocalendar().week, audit_logger=logger
+        ).reconcile()
+        reporter.set_reconciliation_result(
+            reconciled_items=result["items"], unresolved_count=FIXTURE["unresolved_count_at_reconciliation"],
+            normal_registered=result["normal_registered"], max_normal=2, reconciliation_report=result
+        )
+        client.activities.assert_called_once()
+
         sm = reporter.generate_summary()
         self.assertEqual(sm["infrastructure"]["http_failed"], 18)
         self.assertEqual(sm["infrastructure"]["outage_seconds"], 49.0)
         self.assertEqual(sm["attempts"]["total"], 6)
         self.assertEqual(len(sm["attempts"]["records"]), 6)
+        self.assertEqual(sm["attempts"]["explicit_success"], 2)
+        self.assertEqual(sm["verification"]["total"], 3)
+        self.assertEqual(sm["verification"]["confirmed_unregistered"], 2)
+        self.assertEqual(sm["verification"]["remains_unknown"], 1)
+        self.assertEqual(len(sm["verification"]["records"]), 3)
         self.assertEqual(sm["reconciliation"]["confirmed_success"], 2)
         self.assertEqual(sm["reconciliation"]["status"], "SUCCESS")
         self.assertIn(sm["verdict"]["status"], (ReportStatus.SUCCESS, ReportStatus.PARTIAL_SUCCESS))
 
-        # 6. 生成 Markdown 报告文本检查
         report_path = reporter.save_markdown_report(report_dir=self.logs_dir, base_name="2026-11-08-verified-report")
-        with open(report_path, "r", encoding="utf-8") as f:
-            md_text = f.read()
-
-        # 严格检查关键章节呈现
-        self.assertIn("- **提交尝试总数**：6", md_text)
-        self.assertIn("- **明确成功 (Explicit Success)**：2", md_text)
-        self.assertIn("- **请求异常总数**：18 次", md_text)
-        self.assertIn("- **累计服务中断**：49.0 秒", md_text)
-        self.assertIn("- **服务端确认报名成功**：2 节", md_text)
-        self.assertIn("户外跑 王彤帆", md_text)
-        self.assertIn("户外跑 周天一", md_text)
-        self.assertIn("### 7.1 活动列表 (activities) 状态", md_text)
-        self.assertIn("### 7.2 冲突检查 (checkConflict) 状态", md_text)
+        md_text = Path(report_path).read_text(encoding="utf-8")
+        for text in ("提交尝试总数**：6", "请求异常总数**：18 次",
+                     "累计服务中断**：49.0 秒", "服务端确认报名成功**：2 节",
+                     "### 7.1 活动列表 (activities) 状态", "### 7.2 冲突检查 (checkConflict) 状态"):
+            self.assertIn(text, md_text)
 
     # ---------------- 6. UNKNOWN 复核成功分支 ----------------
     def test_06_unknown_resolve_success_branch(self):
@@ -286,6 +247,124 @@ class TestRealReplay20261108(unittest.TestCase):
         self.assertEqual(sm["infrastructure"]["http_failed"], 1)
         self.assertEqual(sm["infrastructure"]["http_failures_breakdown"], {500: 1})
         self.assertEqual(sm["conflict_check"]["failures_breakdown"], {502: 1})
+
+
+    def test_09_rule_rejection_does_not_enter_audit_attempt_details(self):
+        logger = AuditLogger(self.logs_dir)
+        request_manager = Mock()
+        request_manager.submit_once.side_effect = AssertionError("Submission is forbidden in this test")
+        store = StateStore(":memory:")
+        self.addCleanup(store.close)
+        manager = RegistrationManager(store, request_manager, logger)
+        manager.register_activity({"id": "blocked", "name": "blocked"}, lambda _: (False, "拒绝"))
+        request_manager.submit_once.assert_not_called()
+        events = AuditLogReader.read_events_from_file(logger._get_event_path(f"{datetime.date.today():%Y%m%d}"))
+        reporter = ResultReporter()
+        reporter.set_audit_summary(AuditLogReader.replay(events, run_id=logger.run_id))
+        attempts = reporter.generate_summary()["attempts"]
+        self.assertEqual((attempts["total"], attempts["records"]), (0, []))
+
+    def test_10_request_pairing_and_activity_failure_breakdown(self):
+        path = "education/app/activity/getActivityList"
+        rows = [
+            ("start", "http_request_started", "other", "checkConflict", None),
+            ("other", "http_request_failed", "other", "checkConflict", 502),
+            ("fallback", "list_fault_started", "missing", path, 503),
+            ("paired", "list_fault_started", "list", path, 500),
+            ("transport", "http_request_failed", "list", path, 500),
+        ]
+        events = [
+            {"event_id": eid, "run_id": "r", "event_type": EventType.INFRASTRUCTURE,
+             "event_name": event, "request_id": request_id, "details": {"path": url}, "http_status": code}
+            for eid, event, request_id, url, code in rows
+        ]
+        events.append({
+            "event_id": "conflict", "run_id": "r", "event_type": EventType.CONFLICT,
+            "event_name": EventName.CONFLICT_CHECK_FAILED, "http_status": 502,
+        })
+        for sequence in (events, list(reversed(events))):
+            summary = AuditLogReader.replay(sequence)
+            reporter = ResultReporter()
+            reporter.set_audit_summary(summary)
+            reporter.set_audit_summary(summary)
+            result = reporter.generate_summary()
+            self.assertEqual(summary["http_requests_failed"], 3)
+            self.assertEqual(result["infrastructure"]["http_failures_breakdown"], {500: 1, 503: 1})
+            self.assertEqual(result["conflict_check"]["failures_breakdown"], {502: 1})
+            reporter.set_audit_summary(AuditLogReader.replay([]))
+            self.assertEqual(reporter.generate_summary()["conflict_check"]["failures_breakdown"], {})
+
+    def test_11_zero_outage_remains_authoritative_and_missing_can_fall_back(self):
+        record = {"event_type": EventType.INFRASTRUCTURE, "event_name": "list_ok",
+                  "details": {"outage_sec": 0}, "duration_ms": 10000}
+        reporter = ResultReporter()
+        reporter.set_audit_summary(AuditLogReader.replay([record]))
+        reporter.set_circuit_metrics(9, 1)
+        self.assertEqual((reporter.outage_seconds, reporter.breaker_trips), (0.0, 0))
+        reporter.set_audit_summary(AuditLogReader.replay([]))
+        reporter.set_circuit_metrics(9, 1)
+        self.assertEqual(reporter.outage_seconds, 9.0)
+
+    def test_12_legacy_dedup_and_explicit_restart_scope(self):
+        raw = json.dumps({"event": "list_fail", "http": 500, "t": "2026-11-08T14:05:00"})
+        first = AuditLogReader.parse_line(raw, line_no=0)
+        duplicate = AuditLogReader.parse_line(raw, line_no=2)
+        previous = dict(first, run_id="previous", event_id="previous_id")
+        current = dict(first, run_id="current", event_id="current_id")
+        foreign = dict(current, run_id="other")
+        rows = [foreign, previous, current, first, duplicate]
+        self.assertEqual(AuditLogReader.replay(rows, run_id="current")["http_requests_failed"], 1)
+        self.assertEqual(AuditLogReader.replay(rows, run_ids={"previous", "current"})["http_requests_failed"], 2)
+        self.assertEqual(AuditLogReader.replay(rows, run_id="legacy_run")["http_requests_failed"], 1)
+        self.assertEqual(AuditLogReader.replay(rows, start_time="2026-11-08T14:06:00")["total_events"], 0)
+
+    def test_13_unknown_barrier_records_each_read_only_lookup_once(self):
+        logger = AuditLogger(self.logs_dir)
+        client = Mock()
+        client.activities.return_value = ActivityList([{"id": "pending", "isRegister": False}], complete=True)
+        store = StateStore(":memory:")
+        self.addCleanup(store.close)
+        store.reserve_submitting("pending", "pending")
+        store.record_unknown("pending", "pending")
+        manager = RegistrationManager(store, RequestManager(client, audit_logger=logger), logger)
+        manager.resolve_unknown("pending", "pending")
+        client.call.assert_not_called()
+        events = AuditLogReader.read_events_from_file(logger._get_event_path(f"{datetime.date.today():%Y%m%d}"))
+        summary = AuditLogReader.replay(events, run_id=logger.run_id)
+        self.assertEqual(summary["submission_started_count"], 0)
+        self.assertEqual(summary["verification_started_count"], 1)
+        self.assertEqual(summary["verification_confirmed_unregistered_count"], 1)
+        self.assertEqual(summary["verification_records"][0]["status"], "RETRYABLE")
+
+    def test_14_changing_failure_code_keeps_first_outage_start(self):
+        logger = Mock()
+        client = Client({}, audit_logger=logger)
+        start = datetime.datetime(2026, 11, 8, 14, 0, 0)
+        with patch("lejian.log"), patch("lejian.datetime.datetime", wraps=datetime.datetime) as clock:
+            clock.now.return_value = start
+            client._note_fail(500)
+            clock.now.return_value = start + datetime.timedelta(seconds=10)
+            client._note_fail(502)
+            clock.now.return_value = start + datetime.timedelta(seconds=20)
+            client._note_ok()
+        self.assertEqual(logger.record_event.call_args.kwargs["details"]["outage_sec"], 20)
+
+
+    def test_15_client_list_failure_uses_transport_request_id(self):
+        logger = AuditLogger(self.logs_dir)
+        client = Client({"accessToken": "offline-test", "schoolId": "test", "semesterId": "test"},
+                        audit_logger=logger)
+        with patch.object(client, "ensure_token"), patch("lejian.log"), patch(
+            "lejian.urllib.request.urlopen", side_effect=OSError("simulated offline failure")
+        ) as urlopen:
+            result = client.activities()
+        urlopen.assert_called_once()
+        self.assertFalse(result.complete)
+        events = AuditLogReader.read_events_from_file(logger._get_event_path(f"{datetime.date.today():%Y%m%d}"))
+        ids = {event["event_name"]: event["request_id"] for event in events}
+        self.assertTrue(ids["list_fault_started"])
+        self.assertEqual(ids["list_fault_started"], ids[EventName.HTTP_REQUEST_FAILED])
+        self.assertEqual(AuditLogReader.replay(events)["activities_requests_failed"], 1)
 
 
 if __name__ == "__main__":

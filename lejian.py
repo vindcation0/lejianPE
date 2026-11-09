@@ -348,9 +348,13 @@ class Client:
 
     def post(self, path, body, timeout=15):
         self.ensure_token()
+        request_id = None
+        if self.audit_logger and path == "education/app/activity/getActivityList":
+            request_id = uuid.uuid4().hex
+            self._last_list_request_id = request_id
         return _request("POST", path, body=body, timeout=timeout,
                         token=self.s["accessToken"], school_id=self.s["schoolId"],
-                        audit_logger=self.audit_logger)
+                        audit_logger=self.audit_logger, request_id=request_id)
 
     def get(self, path, params=None, timeout=15):
         self.ensure_token()
@@ -371,7 +375,8 @@ class Client:
         """只在状态变化时记录，避免刷屏；用于事后还原故障时段"""
         if getattr(self, "_last_fail", None) != code:
             self._last_fail = code
-            self._fail_since = datetime.datetime.now()
+            if getattr(self, "_fail_since", None) is None:
+                self._fail_since = datetime.datetime.now()
             log(f"  [列表异常] HTTP {code}，开始记录")
             if self.audit_logger and hasattr(self.audit_logger, "record_event"):
                 try:
@@ -380,6 +385,7 @@ class Client:
                         event_name="list_fault_started",
                         http_status=code,
                         source="client_list",
+                        request_id=getattr(self, "_last_list_request_id", None),
                         details={"event": "list_fail", "http": code}
                     )
                 except Exception:
@@ -402,6 +408,7 @@ class Client:
             dur = (datetime.datetime.now() - since).total_seconds() if since else 0
             log(f"  [列表恢复] 中断约 {dur:.0f} 秒")
             self._last_fail = None
+            self._fail_since = None
             if self.audit_logger and hasattr(self.audit_logger, "record_event"):
                 try:
                     self.audit_logger.record_event(
@@ -447,6 +454,7 @@ class Client:
         while page <= 10:
             code, obj = None, None
             for attempt_idx in range(total_attempts):
+                self._last_list_request_id = None
                 code, obj = self.call("POST", "education/app/activity/getActivityList",
                                       {"state": 1, "page": page, "size": page_size,
                                        "semesterId": self.s["semesterId"]},
@@ -1126,7 +1134,6 @@ def _cmd_grab_inner(cfg, st, lock=None):
             res_ok, res_status, res_msg, remote_item = reg_mgr.resolve_unknown(unres_aid, unres_name)
             if res_status == RegistrationStatus.SUCCESS:
                 log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认报名成功！")
-                reporter.record_verification(unres_aid, unres_name, "SUCCESS", "复核确认已报名")
                 it_for_quota = remote_item or next((x for x in items if str(x.get("id")) == str(unres_aid)), None) or target_unres
                 if isinstance(it_for_quota, dict) and "startTime" in it_for_quota:
                     try:
@@ -1144,10 +1151,8 @@ def _cmd_grab_inner(cfg, st, lock=None):
                         pass
             elif res_status == RegistrationStatus.RETRYABLE:
                 log(f"  [安全屏障解除] 未决活动 {unres_name} 经复核确认未报名，释放潜在名额占用。")
-                reporter.record_verification(unres_aid, unres_name, "RETRYABLE", "复核明确确认未报名")
             else:
                 log(f"  [安全屏障保持] 未决活动 {unres_name} 暂无法确认真实状态，继续保持队列冻结。")
-                reporter.record_verification(unres_aid, unres_name, "UNKNOWN", "复核无法确认状态，保持冻结")
                 time.sleep(poll)
                 continue
 
@@ -1260,7 +1265,6 @@ def _cmd_grab_inner(cfg, st, lock=None):
                 it, validate_rules_cb=validate_rules
             )
             log(f"  报名 {name} -> [{final_status}] {reason}")
-            reporter.record_attempt(aid, name, final_status, reason)
 
             if final_status == RegistrationStatus.UNKNOWN:
                 # 核心安全屏障 (U01, U02, U03): 结果未知立即冻结整个候选队列，严禁继续提交下一候选！
@@ -1297,14 +1301,21 @@ def _cmd_grab_inner(cfg, st, lock=None):
 
     # 从统一审计日志回放权威运行指标
     try:
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        evt_path = audit_logger._get_event_path(today_str)
-        run_events = AuditLogReader.read_events_from_file(evt_path)
-        audit_summary = AuditLogReader.replay(run_events, run_id=audit_logger.run_id)
+        run_events = []
+        day = audit_logger.started_on
+        while day <= datetime.date.today():
+            evt_path = audit_logger._get_event_path(day.strftime("%Y%m%d"))
+            run_events.extend(AuditLogReader.read_events_from_file(evt_path))
+            day += datetime.timedelta(days=1)
+        audit_summary = AuditLogReader.replay(run_events, run_id=audit_logger.run_id, log_dir=audit_logger.logs_dir)
         reporter.set_audit_summary(audit_summary)
+        if audit_summary["total_events"] == 0:
+            reporter.audit_degraded = True
     except Exception as e:
+        reporter.audit_degraded = True
         log(f"[审计回放提示] 读取当前运行事件回放失败: {e}")
 
+    reporter.bind_audit_logger(audit_logger)
     reporter.set_local_state_store(state_store)
     reporter.current_week = cw
     reporter.set_circuit_metrics(

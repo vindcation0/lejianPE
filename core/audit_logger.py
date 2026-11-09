@@ -14,6 +14,7 @@
 """
 import collections
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -130,6 +131,7 @@ class AuditLogger:
         self.write_error_count = 0
         # 同一次程序运行使用全局统一的 run_id
         now_dt = datetime.datetime.now()
+        self.started_on = now_dt.date()
         self.run_id = run_id or f"run_{now_dt.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
     def _get_request_path(self, date_str: str) -> str:
@@ -302,7 +304,7 @@ class AuditLogReader:
 
     @staticmethod
     def parse_line(line: str, line_no: Optional[int] = None) -> Optional[Dict]:
-        """解析单行 JSONL 审计事件，兼容 Schema v1 与旧版格式"""
+        """解析单行审计事件。旧格式的事件标识不依赖文件位置。"""
         raw = line.strip()
         if not raw:
             return None
@@ -319,9 +321,13 @@ class AuditLogReader:
 
             # 若为旧版事件格式: {"t": "...", "event": "...", ...}
             legacy_evt = str(data.get("event") or "legacy_event")
-            legacy_t = data.get("t") or datetime.datetime.now().isoformat()
+            legacy_t = data.get("t") or data.get("timestamp")
             legacy_http = data.get("http") or data.get("http_status")
-            evt_id = data.get("event_id") or (f"legacy_{line_no}_{abs(hash(raw))}" if line_no is not None else f"legacy_{abs(hash(raw))}")
+            if data.get("action") in ("sign_up", "sign_up_and_verify") and data.get("started_at"):
+                legacy_t = data["started_at"]
+                legacy_evt = EventName.SUBMISSION_STARTED
+            canonical = json.dumps(data, sort_keys=True, ensure_ascii=False)
+            evt_id = data.get("event_id") or "legacy_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
             # 精准语义映射：严格区分 Verification、Infrastructure、Submission 与 Conflict
             if legacy_evt.startswith("resolve_unknown") or "verify" in legacy_evt:
@@ -376,8 +382,8 @@ class AuditLogReader:
             return []
         events = []
         with open(file_path, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                parsed = cls.parse_line(line, line_no=idx)
+            for line in f:
+                parsed = cls.parse_line(line)
                 if parsed:
                     events.append(parsed)
         return events
@@ -389,7 +395,9 @@ class AuditLogReader:
         run_id: Optional[str] = None,
         log_dir: Optional[str] = None,
         start_time: Optional[str] = None,
-        end_time: Optional[str] = None
+        end_time: Optional[str] = None,
+        *,
+        run_ids: Optional[Set[str]] = None
     ) -> Dict[str, Any]:
         """
         基于事件日志的幂等统计回放：
@@ -400,23 +408,95 @@ class AuditLogReader:
         seen_event_ids: Set[str] = set()
         deduped_events: List[Dict] = []
 
+        if run_id is not None and run_ids is not None:
+            raise ValueError("Use either run_id or run_ids")
+        selected_runs = {run_id} if run_id is not None else run_ids
+        start = datetime.datetime.fromisoformat(start_time).timestamp() if start_time else None
+        end = datetime.datetime.fromisoformat(end_time).timestamp() if end_time else None
         for evt in events:
+            if selected_runs is not None and evt.get("run_id") not in selected_runs:
+                continue
+            if start is not None or end is not None:
+                try:
+                    ts = datetime.datetime.fromisoformat(evt.get("timestamp") or evt.get("t")).timestamp()
+                except (ValueError, TypeError, OSError, OverflowError):
+                    continue
+                if (start is not None and ts < start) or (end is not None and ts > end):
+                    continue
             eid = evt.get("event_id")
             if eid:
                 if eid in seen_event_ids:
                     continue
                 seen_event_ids.add(eid)
-            # 时间窗口过滤 (ISO 8601 字符串比较，精准限制历史会话)
-            evt_ts = evt.get("timestamp") or evt.get("t")
-            if evt_ts:
-                if start_time and evt_ts < start_time:
-                    continue
-                if end_time and evt_ts > end_time:
-                    continue
-            # 若过滤特定 run_id
-            if run_id and evt.get("run_id") != run_id:
-                continue
             deduped_events.append(evt)
+
+        def correlation_key(evt):
+            return (evt.get("run_id"), evt.get("activity_id"), evt.get("correlation_id"))
+
+        def request_key(evt):
+            return (evt.get("run_id"), evt.get("request_id"))
+
+        def is_activities(evt):
+            path = (evt.get("details") or {}).get("path")
+            return isinstance(path, str) and path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1] == "getActivityList"
+
+        http_names = (
+            EventName.HTTP_REQUEST_STARTED, EventName.HTTP_REQUEST_SUCCEEDED, EventName.HTTP_REQUEST_FAILED
+        )
+        activity_scope_known = any(
+            evt.get("event_type") == EventType.INFRASTRUCTURE and (
+                evt.get("event_name") in ("list_fail", "list_fault_started", "list_ok")
+                or (evt.get("event_name") in http_names and (evt.get("details") or {}).get("path"))
+            ) for evt in deduped_events
+        )
+        failed_requests = {
+            request_key(evt) for evt in deduped_events
+            if evt.get("event_type") == EventType.INFRASTRUCTURE
+            and evt.get("event_name") == EventName.HTTP_REQUEST_FAILED and evt.get("request_id")
+        }
+        activity_requests = {
+            request_key(evt) for evt in deduped_events if evt.get("request_id") and is_activities(evt)
+        }
+        submission_statuses = {
+            EventName.SUBMISSION_SUCCEEDED: "SUCCESS",
+            EventName.SUBMISSION_FAILED: "FAILED",
+            EventName.SUBMISSION_UNKNOWN: "UNKNOWN",
+        }
+        submission_results = {
+            correlation_key(evt): evt for evt in deduped_events
+            if evt.get("event_type") == EventType.SUBMISSION and evt.get("correlation_id")
+            and evt.get("event_name") in submission_statuses
+        }
+        verification_results = {}
+        verification_statuses = {
+            EventName.VERIFICATION_CONFIRMED_REGISTERED: "SUCCESS",
+            EventName.VERIFICATION_CONFIRMED_UNREGISTERED: "RETRYABLE",
+            EventName.VERIFICATION_REMAINS_UNKNOWN: "UNKNOWN",
+        }
+        wrapper_verifications = {
+            correlation_key(evt) for evt in deduped_events
+            if evt.get("event_type") == EventType.VERIFICATION and evt.get("correlation_id")
+            and evt.get("source") == "registration_manager" and evt.get("event_name") == EventName.VERIFICATION_STARTED
+        }
+        for evt in deduped_events:
+            if (evt.get("event_type") == EventType.VERIFICATION and evt.get("event_name") in verification_statuses
+                    and evt.get("correlation_id")
+                    and not (evt.get("source") == "request_manager" and correlation_key(evt) in wrapper_verifications)):
+                verification_results[correlation_key(evt)] = evt
+
+        def detail_record(start_evt, outcome_evt, status):
+            details = start_evt.get("details") or {}
+            timestamp = start_evt.get("timestamp") or ""
+            return {
+                "event_id": start_evt.get("event_id"),
+                "request_id": start_evt.get("request_id"),
+                "run_id": start_evt.get("run_id"),
+                "activity_id": start_evt.get("activity_id"),
+                "activity_name": details.get("name") or details.get("activity_name") or start_evt.get("activity_id"),
+                "time": timestamp[11:19] if "T" in timestamp else timestamp,
+                "status": status,
+                "reason": outcome_evt.get("reason") or details.get("error_message") or "",
+            }
 
         # 统计计数器
         candidate_count = 0
@@ -430,6 +510,7 @@ class AuditLogReader:
         submission_succeeded_count = 0
         submission_failed_count = 0
         submission_unknown_count = 0
+        submission_records = []
 
         # Verification (与 Submission 严格分离)
         verification_started_count = 0
@@ -437,6 +518,7 @@ class AuditLogReader:
         verification_confirmed_unregistered_count = 0
         verification_remains_unknown_count = 0
         verification_durations: List[float] = []
+        verification_records = []
 
         # Reconciliation
         reconciliation_started_count = 0
@@ -449,6 +531,7 @@ class AuditLogReader:
         http_requests_failed = 0
         http_failures_by_code = collections.Counter()
         http_durations: List[float] = []
+        activity_durations: List[float] = []
 
         # 请求级关联与配对跟踪 (request_id)
         started_request_ids: Set[str] = set()
@@ -459,6 +542,9 @@ class AuditLogReader:
         circuit_half_open_count = 0
         circuit_closed_count = 0
         outage_seconds_accumulated = 0.0
+        has_outage_measurement = False
+        activity_total = activity_succeeded = activity_failed = 0
+        activity_failures_by_code = collections.Counter()
 
         # 冲突检查与智能降级统计 (Phase 5)
         conflict_check_started_count = 0
@@ -513,6 +599,20 @@ class AuditLogReader:
             elif etype == EventType.SUBMISSION:
                 if ename == EventName.SUBMISSION_STARTED:
                     submission_started_count += 1
+                    details = evt.get("details") or {}
+                    outcome = submission_results.get(correlation_key(evt), {})
+                    status = outcome.get("status") or submission_statuses.get(
+                        outcome.get("event_name"), "SUBMITTING"
+                    )
+                    if details.get("action") in ("sign_up", "sign_up_and_verify"):
+                        status = details.get("final_state") or "UNKNOWN"
+                        if details["action"] == "sign_up_and_verify":
+                            submission_unknown_count += 1
+                        elif status == "SUCCESS":
+                            submission_succeeded_count += 1
+                        elif status == "FAILED":
+                            submission_failed_count += 1
+                    submission_records.append(detail_record(evt, outcome, status))
                 elif ename == EventName.SUBMISSION_SUCCEEDED:
                     submission_succeeded_count += 1
                 elif ename == EventName.SUBMISSION_FAILED:
@@ -522,6 +622,10 @@ class AuditLogReader:
 
             # 3. Verification 服务端复核
             elif etype == EventType.VERIFICATION:
+                key = correlation_key(evt)
+                source = evt.get("source")
+                if source == "reconciliation" or (source == "request_manager" and key in wrapper_verifications):
+                    continue
                 if dur is not None:
                     try:
                         verification_durations.append(float(dur))
@@ -529,7 +633,15 @@ class AuditLogReader:
                         pass
                 if ename == EventName.VERIFICATION_STARTED:
                     verification_started_count += 1
-                elif ename == EventName.VERIFICATION_CONFIRMED_REGISTERED:
+                    outcome = verification_results.get(key, {})
+                    verification_records.append(detail_record(
+                        evt, outcome, verification_statuses.get(outcome.get("event_name"), "VERIFYING")
+                    ))
+                elif ename in verification_statuses and evt.get("source") == "legacy_reader":
+                    # 旧式屏障日志只有结束事件，每条结束事件代表一次复核。
+                    verification_started_count += 1
+                    verification_records.append(detail_record(evt, evt, verification_statuses[ename]))
+                if ename == EventName.VERIFICATION_CONFIRMED_REGISTERED:
                     verification_confirmed_registered_count += 1
                 elif ename == EventName.VERIFICATION_CONFIRMED_UNREGISTERED:
                     verification_confirmed_unregistered_count += 1
@@ -547,33 +659,38 @@ class AuditLogReader:
 
             # 5. Infrastructure
             elif etype == EventType.INFRASTRUCTURE:
+                list_request = is_activities(evt) or (req_id and request_key(evt) in activity_requests)
                 if dur is not None and ename in (EventName.HTTP_REQUEST_SUCCEEDED, EventName.HTTP_REQUEST_FAILED):
                     try:
-                        http_durations.append(float(dur))
-                    except Exception:
+                        duration = float(dur)
+                        http_durations.append(duration)
+                        if list_request:
+                            activity_durations.append(duration)
+                    except (TypeError, ValueError):
                         pass
 
                 if ename == EventName.HTTP_REQUEST_STARTED:
                     http_requests_total += 1
+                    activity_total += bool(list_request)
                 elif ename == EventName.HTTP_REQUEST_SUCCEEDED:
                     http_requests_succeeded += 1
-                elif ename in (EventName.HTTP_REQUEST_FAILED, "list_fail"):
+                    activity_succeeded += bool(list_request)
+                elif ename in (EventName.HTTP_REQUEST_FAILED, "list_fail", "list_fault_started"):
+                    if ename == "list_fault_started" and req_id and request_key(evt) in failed_requests:
+                        continue
+                    # 老版兼容事件曾把复核失败写成 HTTP 失败，不能当作传输故障。
+                    if evt.get("source") == "legacy_log_event" and code is None and not req_id:
+                        continue
+                    list_failure = bool(list_request or ename in ("list_fail", "list_fault_started"))
                     http_requests_failed += 1
+                    activity_failed += list_failure
                     if code is not None:
                         try:
                             http_failures_by_code[int(code)] += 1
-                        except Exception:
+                            if list_failure:
+                                activity_failures_by_code[int(code)] += 1
+                        except (TypeError, ValueError):
                             pass
-                elif ename == "list_fault_started":
-                    # 若同一事件集中未记录底层 http_request_failed，由 list_fault_started 作为事实来源；
-                    # 若底层已有 http_request_failed，则视为状态切换标记，防同一故障双重计数 (A13)
-                    if http_requests_total == 0:
-                        http_requests_failed += 1
-                        if code is not None:
-                            try:
-                                http_failures_by_code[int(code)] += 1
-                            except Exception:
-                                pass
                 elif ename == EventName.CIRCUIT_OPEN:
                     circuit_trips += 1
                 elif ename == EventName.CIRCUIT_HALF_OPEN:
@@ -581,16 +698,19 @@ class AuditLogReader:
                 elif ename in (EventName.CIRCUIT_CLOSED, EventName.INFRASTRUCTURE_RECOVERED, "list_ok", "infrastructure_recovered"):
                     circuit_closed_count += 1
                     det = evt.get("details") or {}
-                    outage_sec = det.get("outage_sec") or det.get("outage_seconds") or evt.get("outage_sec") or evt.get("outage_seconds")
+                    outage_sec = next((data[key] for data in (det, evt)
+                                       for key in ("outage_sec", "outage_seconds") if data.get(key) is not None), None)
                     if outage_sec is not None:
                         try:
                             outage_seconds_accumulated += float(outage_sec)
+                            has_outage_measurement = True
                         except Exception:
                             pass
                     elif det.get("duration_ms") is not None or evt.get("duration_ms") is not None:
                         try:
                             ms_val = float(det.get("duration_ms") if det.get("duration_ms") is not None else evt.get("duration_ms"))
                             outage_seconds_accumulated += (ms_val / 1000.0)
+                            has_outage_measurement = True
                         except Exception:
                             pass
 
@@ -625,12 +745,13 @@ class AuditLogReader:
 
         marker_degraded = False
         target_dir = log_dir or os.path.join(ROOT, "logs")
-        if run_id and os.path.isdir(target_dir):
-            marker_file = os.path.join(target_dir, f".degraded_{run_id}")
-            if os.path.exists(marker_file):
-                marker_degraded = True
+        if selected_runs and os.path.isdir(target_dir):
+            marker_degraded = any(
+                os.path.exists(os.path.join(target_dir, f".degraded_{rid}")) for rid in selected_runs
+            )
 
         return {
+            "run_id": run_id,
             "total_events": len(deduped_events),
             "distinct_event_ids": len(seen_event_ids),
             "runs_count": len(runs_observed),
@@ -643,11 +764,13 @@ class AuditLogReader:
             "candidate_reasons": dict(candidate_reasons),
             # Submission (真实提交)
             "submission_started_count": submission_started_count,
+            "submission_records": submission_records,
             "submission_succeeded_count": submission_succeeded_count,
             "submission_failed_count": submission_failed_count,
             "submission_unknown_count": submission_unknown_count,
             # Verification (复核，绝不计入 Submission)
             "verification_started_count": verification_started_count,
+            "verification_records": verification_records,
             "verification_confirmed_registered_count": verification_confirmed_registered_count,
             "verification_confirmed_unregistered_count": verification_confirmed_unregistered_count,
             "verification_remains_unknown_count": verification_remains_unknown_count,
@@ -658,6 +781,13 @@ class AuditLogReader:
             "reconciliation_failed_count": reconciliation_failed_count,
             # Infrastructure HTTP
             "http_requests_total": http_requests_total,
+            "activities_metrics_scoped": activity_scope_known,
+            "activities_requests_total": activity_total,
+            "activities_requests_succeeded": activity_succeeded,
+            "activities_requests_failed": activity_failed,
+            "activities_failures_by_code": dict(activity_failures_by_code),
+            "activities_avg_duration_ms": round(sum(activity_durations) / len(activity_durations), 2)
+            if activity_durations else 0.0,
             "http_requests_succeeded": http_requests_succeeded,
             "http_requests_failed": http_requests_failed,
             "http_failures_by_code": dict(http_failures_by_code),
@@ -671,7 +801,7 @@ class AuditLogReader:
             "circuit_trips": circuit_trips,
             "circuit_half_open_count": circuit_half_open_count,
             "circuit_closed_count": circuit_closed_count,
-            "outage_seconds": round(outage_seconds_accumulated, 2),
+            "outage_seconds": round(outage_seconds_accumulated, 2) if has_outage_measurement else None,
             # Conflict Check (Phase 5)
             "conflict_check_started_count": conflict_check_started_count,
             "conflict_check_succeeded_count": conflict_check_succeeded_count,
