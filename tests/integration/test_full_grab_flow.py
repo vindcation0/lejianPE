@@ -281,6 +281,10 @@ class TestFullGrabFlow(unittest.TestCase):
     # I13: 与课表固定时段冲突在提交前阻断
     # -------------------------------------------------------------------------
     def test_I13_timetable_collision_blocked(self):
+        # 检查器按本地时间匹配课表，测试活动也从本地时间生成。
+        candidate = self.env.server.activities_db["act_101"]
+        candidate["startTime"] = int(datetime.datetime(2026, 11, 8, 22).timestamp() * 1000)
+        candidate["endTime"] = int(datetime.datetime(2026, 11, 9).timestamp() * 1000)
         # 课表有固定课程与 22:00 - 00:00 冲突
         self.env.tt["busy_slots"] = [{
             "label": "高等数学",
