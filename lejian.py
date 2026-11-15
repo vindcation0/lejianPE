@@ -919,8 +919,10 @@ def _cmd_grab_inner(cfg, st, lock=None):
     state_store = StateStore(DB_PATH)
     audit_logger = AuditLogger(LOGS)
     c = Client(st, audit_logger=audit_logger)
-    retry_policy = RetryPolicy(base_delay=0.5, max_delay=8.0)
-    circuit_breaker = CircuitBreaker(failure_threshold=3, base_cooldown=2.0, max_cooldown=30.0, audit_logger=audit_logger)
+    retry_policy = RetryPolicy(base_delay=0.4, max_delay=1.5)
+    # 开抢窗口内服务器必然过载：熔断阈值放宽、冷却压短，
+    # 否则熔断 OPEN 会把轮询退化到 30 秒一次（2026-11-15 实测 37 秒/次）
+    circuit_breaker = CircuitBreaker(failure_threshold=20, base_cooldown=1.0, max_cooldown=3.0, audit_logger=audit_logger)
     reporter = ResultReporter(run_date=datetime.date.today(), run_id=audit_logger.run_id)
     reporter.bind_audit_logger(audit_logger)
     reporter.set_local_state_store(state_store)
@@ -1015,8 +1017,11 @@ def _cmd_grab_inner(cfg, st, lock=None):
     )
     log(preflight_rep.format_console())
     if preflight_rep.status == PreflightStatus.BLOCKED:
-        log("[Preflight 安全阻断] 存在关键健康检查失败项，抢课程序已安全中止！")
-        return
+        if os.environ.get("LJ_SKIP_PREFLIGHT") == "1":
+            log("[Preflight 覆盖] LJ_SKIP_PREFLIGHT=1，忽略阻断继续运行（开抢窗口专用）")
+        else:
+            log("[Preflight 安全阻断] 存在关键健康检查失败项，抢课程序已安全中止！")
+            return
     elif preflight_rep.status == PreflightStatus.DEGRADED_READY:
         log("[Preflight 降级提醒] checkConflict 故障，将自动降级进入本地规则冲突判定模式 (LOCAL_FALLBACK)！")
     else:
